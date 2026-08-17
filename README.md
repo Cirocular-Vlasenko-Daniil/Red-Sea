@@ -24,8 +24,6 @@
 - Per-parameter freeze, independent of the global performance modes
 - Settings are written to flash and persist across power cycles
 
-![[image_2026-08-17_10-06-41.png]]
-
 ## Hardware
 
 This firmware was developed for the **ESPidi** hardware platform, designed by Eugene Carlo. It doesn't require that specific board, though — anyone can build a compatible device by wiring an ESP32-C3, an SSD1306 128×32 OLED, a rotary encoder, and three buttons according to the pinout below.
