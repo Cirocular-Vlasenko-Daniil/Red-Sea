@@ -38,7 +38,7 @@ This firmware was developed for the **ESPidi** hardware platform, designed by Eu
 | MIDI | Standard 31250 baud DIN in/out over UART |
 | Power | USB-C |
 
-See [MANUAL.md](MANUAL.md) for the full pin-out, control gestures, and a page-by-page parameter reference. Русская версия: [README.ru.md](README.ru.md) / [MANUAL.ru.md](MANUAL.ru.md).
+See [MANUAL.md](MANUAL.md) for the full pin-out, control gestures, and a page-by-page parameter reference.
 
 ## Building & flashing
 
