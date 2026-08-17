@@ -2,7 +2,7 @@
 
 **A weather-themed algorithmic MIDI sequencer and CC modulator, built on a single ESP32-C3.**
 
-**RED SEA** generates continuously evolving MIDI Control Change modulation and step-sequenced notes, controlled by one of four algorithmic engines. It has a 128×32 OLED display, one encoder, four buttons, and standard DIN MIDI in/out. Built for hardware platform **ESPidi** by Eugene Carlo
+**RED SEA** generates continuously evolving MIDI Control Change modulation and step-sequenced notes, controlled by one of four algorithmic engines. It has a 128×32 OLED display, one encoder, four buttons, and standard DIN MIDI in/out. Built for hardware platform [**ESPidi** by Eugene Carlo](https://github.com/EugeneCarlo/ESPidi)
 
 ---
 
