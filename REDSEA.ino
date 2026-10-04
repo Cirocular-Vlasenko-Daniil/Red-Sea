@@ -492,6 +492,15 @@ inline uint8_t getNoise(uint8_t x, uint8_t y, uint32_t time) {
   return (h ^ (h >> 16)) & 0xFF;
 }
 
+// Синус и косинус для анимаций, аргумент которых растёт со временем работы. sinf/cosf
+// из newlib для аргумента больше ~200 переходят на точное, но очень медленное приведение
+// к периоду (у ESP32-C3 нет FPU): через ~3 минуты после включения кадр MAIN дорожал с
+// ~6 до ~32 мс. Здесь большой аргумент сначала приводится к одному периоду через fmod —
+// это быстро; до 200 вычисление в точности прежнее.
+inline float animSin(float a) { if (fabsf(a) > 200.0f) a = fmodf(a, 6.2831853f); return sin(a); }
+inline float animCos(float a) { if (fabsf(a) > 200.0f) a = fmodf(a, 6.2831853f); return cos(a); }
+inline double animCos(double a) { if (fabs(a) > 200.0) a = fmod(a, 6.283185307179586); return cos(a); }
+
 inline uint32_t getAnimTime() {
   if (state.animationPaused) return state.frozenAnimTime;
   return millis() - state.animationTimeOffset;
@@ -2141,8 +2150,8 @@ void drawWaveform(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t type, int8
 void drawSeaLines(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
-  uint8_t yTop = 7 + (int8_t)(sin(time / 1200.0f) * 1.5);
-  uint8_t yBottom = 17 + (int8_t)(cos(time / 1400.0f) * 1.5);
+  uint8_t yTop = 7 + (int8_t)(animSin(time / 1200.0f) * 1.5);
+  uint8_t yBottom = 17 + (int8_t)(animCos(time / 1400.0f) * 1.5);
   // Порог по столбцу зависит только от x и AMT — таблица пересчитывается, лишь когда
   // меняется AMT. Фаза волны от времени одна на весь кадр.
   static uint8_t thresholds[Display::W];
@@ -2159,7 +2168,7 @@ void drawSeaLines(uint32_t time, uint8_t amt, bool bypass=false) {
   }
   float wavePhase = time / 900.0f;
   for (uint8_t x=0; x<Display::W; x++) {
-    int8_t waveOffset = (int8_t)(sin(x * 0.15f + wavePhase) * 1.2);
+    int8_t waveOffset = (int8_t)(animSin(x * 0.15f + wavePhase) * 1.2);
     uint8_t y1 = yTop + waveOffset;
     uint8_t y2 = yBottom + waveOffset;
     uint8_t patTop = bayer[(y1 + time/60) & 7][(x + time/80) & 7];
@@ -2177,8 +2186,8 @@ void drawFog(uint32_t time, uint8_t amt, bool bypass=false) {
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t layer=0; layer<1; layer++) {
     float sp = 0.4f + layer * 0.35f;
-    int8_t ox = (int8_t)(sin(slow / 3500.0f * sp + layer * 2) * (2 + layer * 2));
-    int8_t oy = (int8_t)(cos(slow / 4500.0f * sp + layer * 1.5) * (1 + layer));
+    int8_t ox = (int8_t)(animSin(slow / 3500.0f * sp + layer * 2) * (2 + layer * 2));
+    int8_t oy = (int8_t)(animCos(slow / 4500.0f * sp + layer * 1.5) * (1 + layer));
     uint8_t dens = base + layer * 6;
     for (uint8_t dy=0; dy<16; dy++) {
       for (uint8_t dx=0; dx<Display::W; dx++) {
@@ -2197,14 +2206,14 @@ void drawFog(uint32_t time, uint8_t amt, bool bypass=false) {
 void drawSun(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   uint8_t sx=82, sy=3;
-  uint8_t pulse = (uint8_t)(sin(time / 3000.0f) * 1 + 2);
+  uint8_t pulse = (uint8_t)(animSin(time / 3000.0f) * 1 + 2);
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t i=0; i<6; i++) {
     float ang = (float)i / 6 * 2 * 3.14159f + time / 6000.0f;
     uint8_t len = 1 + pulse / 4;
     for (uint8_t j=0; j<len; j++) {
-      uint8_t rx = sx + cos(ang) * len * j / len;
-      uint8_t ry = sy + sin(ang) * len * j / len;
+      uint8_t rx = sx + animCos(ang) * len * j / len;
+      uint8_t ry = sy + animSin(ang) * len * j / len;
       uint8_t pat = bayer[(ry + time/300) & 7][(rx + time/400) & 7];
       if (pat < 15 + amt/15 && rx < Display::W && ry < Display::H) display.drawPixel(rx, ry, color);
     }
@@ -2282,7 +2291,7 @@ void drawSnow(uint32_t time, uint8_t amt, bool bypass=false) {
     uint8_t r1 = (seed + i*29) & 0x0F, r2 = (seed + i*47) & 0x07;
     uint8_t fallSpeed = 6 + (r1 & 0x03);
     uint8_t px0 = i * (Display::W / num) + (r1 * 5) % (Display::W / num);
-    int8_t drift = (int8_t)(sin((fall / 500.0f) + i * 1.3f) * 2.5f);
+    int8_t drift = (int8_t)(animSin((fall / 500.0f) + i * 1.3f) * 2.5f);
     uint8_t px = (px0 + drift + Display::W) % Display::W;
     uint8_t py = ((fall / fallSpeed) + i*13 + r2) % 18;
     uint8_t pat = bayer[(py + fall/80) & 7][(px + fall/90) & 7];
@@ -2455,7 +2464,7 @@ void drawSailboat(uint8_t x, uint8_t y, uint32_t time, uint8_t amt, bool bypass=
   bool alt = ((time / 400) & 1) == 0;
   const uint8_t (*boat)[8] = alt ? sailboatAlt : sailboat;
   float wave = 1.0f + (amt / 100.0f) * 0.8f;
-  int8_t off = (int8_t)(sin(time / 800.0f * wave) * 1.5);
+  int8_t off = (int8_t)(animSin(time / 800.0f * wave) * 1.5);
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t r=0; r<9; r++) {
     for (uint8_t c=0; c<8; c++) {
