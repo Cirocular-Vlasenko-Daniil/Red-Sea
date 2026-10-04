@@ -1988,6 +1988,11 @@ void drawDitherFill(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fillPct,
   else noiseAmt = 0.7f + (amt - 70) / 30.0f * 0.3f;
   uint16_t speed = constrain(150 - amt * 1.3f, 10, 150);
   uint8_t offset = (uint8_t)((time / speed) % 64);
+  // Пороги не зависят от пикселя — считаем один раз на столбик, а не для каждого
+  // из ~500 пикселей (у ESP32-C3 нет FPU, каждая операция float — программная).
+  float density = fillPct / 100.0f;
+  uint8_t patThreshold = (uint8_t)(56 * (1.0f - noiseAmt * 0.5f));
+  uint8_t noiseThreshold = (uint8_t)(128 * (1.0f - noiseAmt * density));
   for (uint8_t dy=0; dy<rows; dy++) {
     uint8_t py = startY + dy;
     if (py >= y+h) break;
@@ -2000,9 +2005,8 @@ void drawDitherFill(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fillPct,
       if (amt == 0) white = true;
       else if (amt == 100) white = (noise < 128);
       else {
-        float density = fillPct / 100.0f;
-        if (pat < (uint8_t)(56 * (1.0f - noiseAmt * 0.5f))) white = true;
-        else if (noise < (uint8_t)(128 * (1.0f - noiseAmt * density))) white = true;
+        if (pat < patThreshold) white = true;
+        else if (noise < noiseThreshold) white = true;
       }
       if (white) display.drawPixel(px, py, invert ? SSD1306_BLACK : SSD1306_WHITE);
     }
@@ -2053,12 +2057,23 @@ void drawSeaLines(uint32_t time, uint8_t amt, bool bypass=false) {
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   uint8_t yTop = 7 + (int8_t)(sin(time / 1200.0f) * 1.5);
   uint8_t yBottom = 17 + (int8_t)(cos(time / 1400.0f) * 1.5);
+  // Порог по столбцу зависит только от x и AMT — таблица пересчитывается, лишь когда
+  // меняется AMT. Фаза волны от времени одна на весь кадр.
+  static uint8_t thresholds[Display::W];
+  static int16_t thresholdsAmt = -1;
+  if (thresholdsAmt != amt) {
+    for (uint8_t x=0; x<Display::W; x++) {
+      float fade = 1.0;
+      if (x < 40) fade = (float)x / 40.0;
+      else if (x > 88) fade = (float)(Display::W - x) / 40.0;
+      if (fade < 0) fade = 0;
+      thresholds[x] = (uint8_t)(30 + amt / 4 * fade);
+    }
+    thresholdsAmt = amt;
+  }
+  float wavePhase = time / 900.0f;
   for (uint8_t x=0; x<Display::W; x++) {
-    float fade = 1.0;
-    if (x < 40) fade = (float)x / 40.0;
-    else if (x > 88) fade = (float)(Display::W - x) / 40.0;
-    if (fade < 0) fade = 0;
-    int8_t waveOffset = (int8_t)(sin(x * 0.15f + time / 900.0f) * 1.2);
+    int8_t waveOffset = (int8_t)(sin(x * 0.15f + wavePhase) * 1.2);
     uint8_t y1 = yTop + waveOffset;
     uint8_t y2 = yBottom + waveOffset;
     uint8_t patTop = bayer[(y1 + time/60) & 7][(x + time/80) & 7];
@@ -3050,12 +3065,15 @@ void updateDisplay() {
       display.fillScreen(bg);
       uint8_t progress = map(elapsed, 0, 150, 0, 100);
       uint8_t radius = map(progress, 0, 100, 0, 64);
+      // «Пиксель внутри круга» без корня: при целом радиусе floor(sqrt(d²)) < r
+      // равносильно d² < r². Порог узора за кадр не меняется — считаем один раз.
+      int32_t radius2 = (int32_t)radius * radius;
+      long patThreshold = map(progress, 0, 100, 0, 64);
       for (uint8_t y = 0; y < Display::H; y++) {
         for (uint8_t x = 0; x < Display::W; x++) {
           int16_t dx = x - Display::W / 2;
           int16_t dy = y - Display::H / 2;
-          uint8_t dist = sqrt(dx * dx + dy * dy);
-          if (dist < radius) {
+          if (dx * dx + dy * dy < radius2) {
             uint8_t pat = bayer[y & 7][x & 7];
             if (pat < map(progress, 0, 100, 0, 64)) {
               display.drawPixel(x, y, fg);
