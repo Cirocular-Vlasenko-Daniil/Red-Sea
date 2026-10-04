@@ -271,7 +271,7 @@ struct State {
   uint8_t sequencerSteps = 16;
   uint8_t sequencerScaleIndex = 0;
   uint8_t sequencerCC = 00;
-  uint8_t sequencerBPM = 120;
+  uint16_t sequencerBPM = 120;  // 1..300 — в uint8_t не помещается
   uint8_t sequencerCursor = 0;
   uint8_t sequencerPlayhead = 0;
   // Шаг, который реально триггерится/подсвечивается на этом тике.
@@ -3330,7 +3330,9 @@ void loadSettings() {
   state.gfxEnabled = storage.getBool("gfx", true);
   state.sequencerSteps = storage.getUChar("seqSteps", 16);
   if (state.sequencerSteps < 1 || state.sequencerSteps > 16) state.sequencerSteps = 16;
-  state.sequencerBPM = storage.getUChar("seqBPM", 120);
+  // Темп хранится 16-битным под ключом "seqBPM16"; прежние версии писали 8-битный
+  // "seqBPM" — он читается, если нового ключа ещё нет.
+  state.sequencerBPM = storage.getUShort("seqBPM16", storage.getUChar("seqBPM", 120));
   if (state.sequencerBPM < 1 || state.sequencerBPM > 300) state.sequencerBPM = 120;
   state.sequencerCC = storage.getUChar("seqCC", 20);
   state.sequencerScaleIndex = storage.getUChar("seqScale", 0);
@@ -3346,7 +3348,7 @@ void loadSettings() {
 void saveSequencerSettings() {
   storage.begin("redsea", false);
   storage.putUChar("seqSteps", state.sequencerSteps);
-  storage.putUChar("seqBPM", state.sequencerBPM);
+  storage.putUShort("seqBPM16", state.sequencerBPM);
   storage.putUChar("seqCC", state.sequencerCC);
   storage.putUChar("seqScale", state.sequencerScaleIndex);
   storage.putBytes("steps", state.steps, sizeof(state.steps));
@@ -3510,9 +3512,13 @@ void loop() {
         state.needSaveMinMax = false;
       }
       if (state.needSaveCC) {
-        char key[8];
-        sprintf(key, "cc%u", state.selectedParam);
-        storage.putUChar(key, state.params[state.selectedParam].cc);
+        // Все четыре номера: флаг один на всех, а менять их могут рандомизация, сброс и
+        // MIDI Learn, в том числе не для параметра под курсором. Неизменные NVS не перезаписывает.
+        for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+          char key[8];
+          sprintf(key, "cc%u", i);
+          storage.putUChar(key, state.params[i].cc);
+        }
         state.needSaveCC = false;
       }
       if (state.needSaveStorm) {
