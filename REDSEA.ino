@@ -117,6 +117,78 @@ private:
 
 RedSeaDisplay display(Display::W, Display::H, &Wire, -1);
 HardwareSerial midi(1);
+
+// ------------------------------------------------------------
+// Отправка MIDI: очередь вместо прямой записи в UART.
+// Байт на 31250 бод уходит 0,32 мс; пачка CC или нот занимает миллисекунды, и
+// midi.write() при заполненном FIFO ждал бы. Поэтому сообщения встают в очередь, а
+// midiPump() (задача движка, раз в 0,5 мс) докладывает их в аппаратный FIFO понемногу.
+// Реалтайм (Clock, Start, Stop) идёт отдельной очередью вне общей и уходит следующим же
+// байтом — Clock не ждёт пачку CC; по спецификации MIDI его можно вставлять даже внутрь
+// другого сообщения.
+// ------------------------------------------------------------
+#include <hal/uart_ll.h>
+
+namespace MidiOut {
+  constexpr uint16_t RT_SIZE = 64;      // степени двойки
+  constexpr uint16_t TX_SIZE = 1024;
+  constexpr uint32_t FIFO_KEEP = 3;     // байт в FIFO UART: ~1 мс, Clock ждёт не дольше
+  uint8_t rt[RT_SIZE], tx[TX_SIZE];
+  volatile uint16_t rtHead = 0, rtTail = 0, txHead = 0, txTail = 0;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+}
+
+void midiPump() {
+  using namespace MidiOut;
+  portENTER_CRITICAL(&mux);
+  uart_dev_t* hw = UART_LL_GET_HW(1);
+  uint32_t inFifo = UART_LL_FIFO_DEF_LEN - uart_ll_get_txfifo_len(hw);
+  while (inFifo < FIFO_KEEP) {
+    uint8_t b;
+    if (rtTail != rtHead) { b = rt[rtTail]; rtTail = (rtTail + 1) & (RT_SIZE - 1); }
+    else if (txTail != txHead) { b = tx[txTail]; txTail = (txTail + 1) & (TX_SIZE - 1); }
+    else break;
+    uart_ll_write_txfifo(hw, &b, 1);
+    inFifo++;
+  }
+  portEXIT_CRITICAL(&mux);
+}
+
+void midiRealtime(uint8_t b) {
+  using namespace MidiOut;
+  portENTER_CRITICAL(&mux);
+  uint16_t next = (rtHead + 1) & (RT_SIZE - 1);
+  if (next != rtTail) { rt[rtHead] = b; rtHead = next; }
+  portEXIT_CRITICAL(&mux);
+  midiPump();  // обычно уходит сразу
+}
+
+// Сообщение целиком — одной операцией, чтобы сообщения из задачи движка и из loop()
+// не перемешались по байтам.
+void midiMessage(uint8_t s, uint8_t d1, uint8_t d2) {
+  using namespace MidiOut;
+  for (;;) {
+    portENTER_CRITICAL(&mux);
+    uint16_t freeBytes = (txTail - txHead - 1) & (TX_SIZE - 1);
+    if (freeBytes >= 3) {
+      tx[txHead] = s; txHead = (txHead + 1) & (TX_SIZE - 1);
+      tx[txHead] = d1; txHead = (txHead + 1) & (TX_SIZE - 1);
+      tx[txHead] = d2; txHead = (txHead + 1) & (TX_SIZE - 1);
+    }
+    portEXIT_CRITICAL(&mux);
+    if (freeBytes >= 3) break;
+    midiPump();               // очередь полна (~340 сообщений) — ждём, пока UART освободит место
+    delayMicroseconds(100);
+  }
+  midiPump();
+}
+
+// Задача движка (см. «Движок» ниже) и loop() делят состояние. Всё, что меняет его из loop()
+// (кнопки, энкодер, сбросы, сохранение), выполняется под этой блокировкой. Отрисовка только
+// читает состояние и идёт без неё — иначе такты снова ждали бы кадр.
+SemaphoreHandle_t engineMutex = nullptr;
+inline void engineLock()   { if (engineMutex) xSemaphoreTakeRecursive(engineMutex, portMAX_DELAY); }
+inline void engineUnlock() { if (engineMutex) xSemaphoreGiveRecursive(engineMutex); }
 Preferences storage;
 
 // ============================================================
@@ -595,17 +667,17 @@ void midiNoteToString(uint8_t note, char* out) {
 void sendCC(uint8_t cc, uint8_t val) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0xB0 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(cc & 0x7F); midi.write(val & 0x7F);
+  midiMessage(status, cc & 0x7F, val & 0x7F);
 }
 void sendNoteOn(uint8_t note, uint8_t vel) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0x90 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(note & 0x7F); midi.write(vel & 0x7F);
+  midiMessage(status, note & 0x7F, vel & 0x7F);
 }
 void sendNoteOff(uint8_t note) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0x80 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(note & 0x7F); midi.write(0);
+  midiMessage(status, note & 0x7F, 0);
 }
 
 inline int getRandomAmount() {
@@ -1053,6 +1125,13 @@ bool externalClockActive() {
 // не чаще одного раза за проход границы тика — это ЕДИНСТВЕННОЕ,
 // что должно управлять привязанной к темпу логикой во внутреннем
 // режиме.
+uint32_t internalTickPeriodUs() {
+  float bpm = state.sequencerBPM;
+  if (bpm < 1) bpm = 120;
+  float tickPeriodUs = (60.0f / bpm) * 1000000.0f / 24.0f;
+  return (uint32_t)tickPeriodUs;
+}
+
 bool generateInternalTicks() {
   if (!state.sequencerRunning) return false;
   uint32_t now = micros();
@@ -1060,10 +1139,7 @@ bool generateInternalTicks() {
     lastInternalTickMicros = now;
     return false;
   }
-  float bpm = state.sequencerBPM;
-  if (bpm < 1) bpm = 120;
-  float tickPeriodUs = (60.0f / bpm) * 1000000.0f / 24.0f;
-  uint32_t period = (uint32_t)tickPeriodUs;
+  uint32_t period = internalTickPeriodUs();
   if (now - lastInternalTickMicros >= period) {
     lastInternalTickMicros += period;
     return true;
@@ -1429,9 +1505,12 @@ void updateButtons() {
               resetSequencerState();
               state.sequencerStartPending = true;
               state.sequencerStartOnBeat = externalClockActive();
+              // Внутренний темп: RED SEA — ведущий, Start уходит наружу, первый Clock — с шагом 1.
+              if (!state.sequencerStartOnBeat) midiRealtime(0xFA);
             } else {
               seqNotesOff(true);
               resetSequencerState();
+              if (!externalClockActive()) midiRealtime(0xFC);
             }
             state.tapDoubleClicked = true;
             state.lastTapReleaseTime = 0;
@@ -1958,7 +2037,7 @@ void randomizeCurrentPage() {
         state.sequencerScaleIndex = random(0, 4);
         if (state.sequencerCursor >= state.sequencerSteps) state.sequencerCursor = state.sequencerSteps - 1;
         if (state.sequencerPlayhead >= state.sequencerSteps) state.sequencerPlayhead = 0;
-        saveSequencerSettings();
+        // сохранится по таймеру в loop(), когда транспорт остановлен
       }
       state.displayDirty = true;
       break;
@@ -1990,7 +2069,7 @@ void randomizeSequencerAll() {
   state.lastCC = 20;
   state.lastWavesIndex = 2;
   state.displayDirty = true;
-  saveSequencerSettings();
+  // сохранится по таймеру в loop(), когда транспорт остановлен
 }
 
 void resetToDefaults() {
@@ -2102,7 +2181,7 @@ void resetToDefaults() {
         state.lastNote = 72;
         state.lastCC = 00;
         state.lastWavesIndex = 2;
-        saveSequencerSettings();
+        // сохранится по таймеру в loop(), когда транспорт остановлен
       } else if (sub == 1) {
         state.sequencerSteps = 16;
         state.sequencerScaleIndex = 0;
@@ -2110,12 +2189,15 @@ void resetToDefaults() {
         state.sequencerBPM = 120;
         state.sequencerCursor = 0;
         state.sequencerPlayhead = 0;
-        if (state.sequencerRunning) seqNotesOff(true);
+        if (state.sequencerRunning) {
+          seqNotesOff(true);
+          if (!externalClockActive()) midiRealtime(0xFC);
+        }
         state.sequencerRunning = false;
         state.sequencerStartPending = false;
         state.sequencerLastStepTick = 0;
         lastInternalTickMicros = 0;
-        saveSequencerSettings();
+        // сохранится по таймеру в loop(), когда транспорт остановлен
       }
       break;
     default: break;
@@ -3443,6 +3525,69 @@ void saveSequencerSettings() {
 }
 
 // ============================================================
+// Движок: такты, MIDI-вход и отправка — в отдельной задаче
+// ============================================================
+// loop() рисует экран, опрашивает кнопки и пишет настройки во флеш; всё это занимает
+// миллисекунды, и такты, которые проверялись раз за проход loop(), опаздывали на это
+// время. Задача движка с приоритетом выше loop() просыпается каждые 0,5 мс по таймеру и
+// точно к моменту очередного внутреннего такта (отдельный одноразовый таймер).
+#include <esp_timer.h>
+
+TaskHandle_t engineTask = nullptr;
+esp_timer_handle_t engineTimer = nullptr, engineTickTimer = nullptr;
+constexpr uint32_t ENGINE_PERIOD_US = 500;
+
+void onEngineTimer(void*) { if (engineTask) xTaskNotifyGive(engineTask); }
+
+void engineLoop(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+    engineLock();
+    processMIDI();
+    bool internal = state.sequencerRunning && !externalClockActive();
+    if (internal) {
+      // Обычно не больше одного такта; несколько — только если задача стояла (запись во флеш).
+      for (uint8_t n = 0; n < 8 && generateInternalTicks(); n++) {
+        midiRealtime(0xF8);  // Clock наружу: при внутреннем темпе RED SEA — ведущий
+        onClockTick();
+      }
+    } else {
+      lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
+    }
+    midiPump();
+    uint32_t last = lastInternalTickMicros;
+    uint32_t period = internalTickPeriodUs();
+    engineUnlock();
+    // Следующий такт раньше очередного пробуждения — разбудить точно к нему.
+    if (internal && last) {
+      int32_t dt = (int32_t)(last + period - micros());
+      if (dt > 0 && dt <= (int32_t)ENGINE_PERIOD_US) {
+        esp_timer_stop(engineTickTimer);
+        esp_timer_start_once(engineTickTimer, dt);
+      }
+    }
+  }
+}
+
+void engineBegin() {
+  engineMutex = xSemaphoreCreateRecursiveMutex();  // мьютекс с наследованием приоритета
+  xTaskCreate(engineLoop, "engine", 6144, nullptr, configMAX_PRIORITIES - 4, &engineTask);
+  esp_timer_create_args_t args = {};
+  args.callback = onEngineTimer;
+  args.name = "engine";
+  esp_timer_create(&args, &engineTimer);
+  args.name = "engine_tick";
+  esp_timer_create(&args, &engineTickTimer);
+  esp_timer_start_periodic(engineTimer, ENGINE_PERIOD_US);
+}
+
+// Идёт ли транспорт: пока идёт, настройки во флеш не пишутся — запись останавливает
+// процессор на 3–20 мс. Изменения сохранятся после остановки.
+bool transportRunning() {
+  return state.sequencerRunning || state.midiRunning;
+}
+
+// ============================================================
 // 15. SETUP & LOOP
 // ============================================================
 void setup() {
@@ -3476,10 +3621,13 @@ void setup() {
   display.display();
   display.startSender();
   state.displayDirty = true;
+  engineBegin();
 }
 
 void loop() {
-  processMIDI();
+  // MIDI-вход и такты — в задаче движка (engineLoop). Здесь — интерфейс и сохранение;
+  // всё, что меняет общее состояние, под блокировкой, отрисовка — без неё.
+  engineLock();
   updateButtons();
   handleEncoder();
   checkTapPageLongPress();
@@ -3574,20 +3722,12 @@ void loop() {
     state.tapPlayLongPressFrameVisible = false;
   }
 
+  engineUnlock();
   updateDisplay();
-
-  // Внутренний клок: per-tick логика вызывается строго один раз на
-  // настоящий тик, когда generateInternalTicks() возвращает true.
-  if (state.sequencerRunning && !externalClockActive()) {
-    if (generateInternalTicks()) {
-      onClockTick();
-    }
-  } else {
-    lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
-  }
+  engineLock();
 
   uint32_t now = millis();
-  if (now - state.lastSaveTime > 2000) {
+  if (now - state.lastSaveTime > 2000 && !transportRunning()) {
     bool needSave = state.needSaveMinMax || state.needSaveCC || state.needSaveStorm || state.needSaveGlobal;
     if (needSave) {
       storage.begin("redsea", false);
@@ -3645,8 +3785,9 @@ void loop() {
     state.lastSaveTime = now;
   }
   static uint32_t lastSequencerSave = 0;
-  if (now - lastSequencerSave > 5000) {
+  if (now - lastSequencerSave > 5000 && !transportRunning()) {
     saveSequencerSettings();
     lastSequencerSave = now;
   }
+  engineUnlock();
 }
