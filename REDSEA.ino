@@ -1615,15 +1615,24 @@ void checkTapPlayLongPress() {
 // ============================================================
 // 10. ОБРАБОТКА ЭНКОДЕРА
 // ============================================================
-void handleEncoder() {
-  int mov = 0;
-  if (abs(encoderTicks) >= 4) {
-    mov = (encoderTicks > 0) ? 1 : -1;
-    encoderTicks = 0;
-    state.displayDirty = true;
-  }
-  if (mov == 0) return;
+void handleEncoderDetent(int mov);
 
+// Забирает все накопленные щелчки (4 перехода квадратуры на щелчок) и обрабатывает их по
+// одному — пока кадр рисуется, их может набраться несколько, и ни один не должен теряться.
+// Неполный щелчок остаётся на следующий раз. Чтение и вычитание — под запретом прерываний,
+// иначе переход, пришедший между ними, пропал бы.
+void handleEncoder() {
+  noInterrupts();
+  int detents = encoderTicks / 4;
+  encoderTicks -= detents * 4;
+  interrupts();
+  if (detents == 0) return;
+  state.displayDirty = true;
+  int dir = (detents > 0) ? 1 : -1;
+  for (int i = 0; i != detents; i += dir) handleEncoderDetent(dir);
+}
+
+void handleEncoderDetent(int mov) {
   bool tapPressed = (buttons[1].lastStable == LOW);
 
   // SEQUENCER main
