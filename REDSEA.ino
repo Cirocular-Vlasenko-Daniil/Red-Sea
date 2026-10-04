@@ -3440,6 +3440,7 @@ void loop() {
     lastAnimTime = millis();
     if (state.bypassMode == BypassMode::FREEZE && !state.animationPaused) {
       state.animationPaused = true;
+      state.animationPauseTime = millis();  // от неё при выходе отсчитывается длительность паузы
       state.frozenAnimTime = millis() - state.animationTimeOffset;
     } else if (state.bypassMode == BypassMode::OFF && state.animationPaused) {
       state.animationPaused = false;
