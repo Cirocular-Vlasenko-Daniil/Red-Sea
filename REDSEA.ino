@@ -2037,7 +2037,7 @@ void randomizeCurrentPage() {
         state.sequencerScaleIndex = random(0, 4);
         if (state.sequencerCursor >= state.sequencerSteps) state.sequencerCursor = state.sequencerSteps - 1;
         if (state.sequencerPlayhead >= state.sequencerSteps) state.sequencerPlayhead = 0;
-        // сохранится по таймеру в loop(), когда транспорт остановлен
+        // сохранится в loop() через 2 с после последнего изменения
       }
       state.displayDirty = true;
       break;
@@ -2069,7 +2069,7 @@ void randomizeSequencerAll() {
   state.lastCC = 20;
   state.lastWavesIndex = 2;
   state.displayDirty = true;
-  // сохранится по таймеру в loop(), когда транспорт остановлен
+  // сохранится в loop() через 2 с после последнего изменения
 }
 
 void resetToDefaults() {
@@ -2181,7 +2181,7 @@ void resetToDefaults() {
         state.lastNote = 72;
         state.lastCC = 00;
         state.lastWavesIndex = 2;
-        // сохранится по таймеру в loop(), когда транспорт остановлен
+        // сохранится в loop() через 2 с после последнего изменения
       } else if (sub == 1) {
         state.sequencerSteps = 16;
         state.sequencerScaleIndex = 0;
@@ -2197,7 +2197,7 @@ void resetToDefaults() {
         state.sequencerStartPending = false;
         state.sequencerLastStepTick = 0;
         lastInternalTickMicros = 0;
-        // сохранится по таймеру в loop(), когда транспорт остановлен
+        // сохранится в loop() через 2 с после последнего изменения
       }
       break;
     default: break;
@@ -3581,10 +3581,43 @@ void engineBegin() {
   esp_timer_start_periodic(engineTimer, ENGINE_PERIOD_US);
 }
 
-// Идёт ли транспорт: пока идёт, настройки во флеш не пишутся — запись останавливает
-// процессор на 3–20 мс. Изменения сохранятся после остановки.
-bool transportRunning() {
-  return state.sequencerRunning || state.midiRunning;
+// Контрольные суммы сохраняемых настроек: по ним loop() видит момент последнего
+// изменения (флаги needSave* ставятся при первом изменении и о следующих не говорят)
+// и то, изменился ли секвенсор с последнего сохранения.
+static uint32_t fnvAdd(uint32_t h, const void* data, size_t n) {
+  const uint8_t* b = (const uint8_t*)data;
+  for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+  return h;
+}
+#define FNV_FIELD(h, f) h = fnvAdd(h, &(f), sizeof(f))
+
+// Состояние логики сохранения (см. конец loop()).
+struct SaveState {
+  bool init = false;
+  uint32_t lastSig = 0, savedSig = 0, savedSeqSig = 0, lastChangeMs = 0;
+} saveState;
+
+uint32_t sequencerSignature() {
+  uint32_t h = 2166136261u;
+  h = fnvAdd(h, state.steps, sizeof(state.steps));
+  FNV_FIELD(h, state.sequencerSteps); FNV_FIELD(h, state.sequencerBPM);
+  FNV_FIELD(h, state.sequencerCC); FNV_FIELD(h, state.sequencerScaleIndex);
+  return h;
+}
+
+uint32_t settingsSignature() {
+  uint32_t h = 2166136261u;
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+    FNV_FIELD(h, state.params[i].cc); FNV_FIELD(h, state.params[i].min); FNV_FIELD(h, state.params[i].max);
+  }
+  FNV_FIELD(h, state.chaos); FNV_FIELD(h, state.waveIntervalIndex); FNV_FIELD(h, state.weatherMode);
+  FNV_FIELD(h, state.lfoType); FNV_FIELD(h, state.lfoShape); FNV_FIELD(h, state.lfoPhase); FNV_FIELD(h, state.lfoGlide);
+  FNV_FIELD(h, state.sunRflct); FNV_FIELD(h, state.sunArp); FNV_FIELD(h, state.sunDflct); FNV_FIELD(h, state.sunBias);
+  FNV_FIELD(h, state.snowFlake); FNV_FIELD(h, state.snowRotation); FNV_FIELD(h, state.snowFrz); FNV_FIELD(h, state.snowTime);
+  FNV_FIELD(h, state.rainDrip); FNV_FIELD(h, state.rainWet); FNV_FIELD(h, state.rainSplsh); FNV_FIELD(h, state.rainThunder);
+  FNV_FIELD(h, state.midiChannel); FNV_FIELD(h, state.selectedBypassMode); FNV_FIELD(h, state.seqDest);
+  FNV_FIELD(h, state.gfxEnabled);
+  return h;
 }
 
 // ============================================================
@@ -3726,10 +3759,29 @@ void loop() {
   updateDisplay();
   engineLock();
 
+  // Сохранение: через 2 с после последнего изменения — пока крутят энкодер, во флеш ничего
+  // не пишется. Запись останавливает процессор (~2 мс, изредка — до ~20 мс, когда NVS
+  // уплотняет сектор), поэтому, если идут такты, она делается сразу после очередного такта:
+  // до следующего — целый период (20,8 мс на 120 BPM), и такты не опаздывают.
   uint32_t now = millis();
-  if (now - state.lastSaveTime > 2000 && !transportRunning()) {
+  uint32_t seqSig = sequencerSignature();
+  uint32_t sig = settingsSignature() ^ (seqSig * 31u);
+  SaveState& sv = saveState;
+  if (!sv.init) { sv.init = true; sv.lastSig = sv.savedSig = sig; sv.savedSeqSig = seqSig; sv.lastChangeMs = now; }
+  if (sig != sv.lastSig) { sv.lastSig = sig; sv.lastChangeMs = now; }
+  if (sig != sv.savedSig && now - sv.lastChangeMs >= 2000) {
+    // Каждая группа (настройки, секвенсор) пишется в свой промежуток сразу после такта:
+    // две записи подряд на быстром темпе в один промежуток не помещаются.
+    auto waitAfterTick = []() {
+      if (!state.sequencerRunning && !externalClockActive()) return;
+      uint32_t tick = state.midiTicks, waitStart = millis();
+      engineUnlock();
+      while (state.midiTicks == tick && millis() - waitStart < 250) vTaskDelay(1);
+      engineLock();
+    };
     bool needSave = state.needSaveMinMax || state.needSaveCC || state.needSaveStorm || state.needSaveGlobal;
     if (needSave) {
+      waitAfterTick();
       storage.begin("redsea", false);
       if (state.needSaveMinMax) {
         for (uint8_t i = 0; i < NUM_PARAMS; i++) {
@@ -3782,12 +3834,12 @@ void loop() {
       }
       storage.end();
     }
-    state.lastSaveTime = now;
-  }
-  static uint32_t lastSequencerSave = 0;
-  if (now - lastSequencerSave > 5000 && !transportRunning()) {
-    saveSequencerSettings();
-    lastSequencerSave = now;
+    if (seqSig != sv.savedSeqSig) {
+      waitAfterTick();
+      saveSequencerSettings();
+      sv.savedSeqSig = seqSig;
+    }
+    sv.savedSig = sig;
   }
   engineUnlock();
 }
