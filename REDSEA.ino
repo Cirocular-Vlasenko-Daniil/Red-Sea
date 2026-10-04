@@ -29,8 +29,166 @@ namespace Display {
   constexpr uint8_t METER_H = 20;
 }
 
-Adafruit_SSD1306 display(Display::W, Display::H, &Wire, -1);
+// Экран с передачей кадра по I²C в отдельной задаче. Отрисовка идёт как раньше, в буфер
+// Adafruit_SSD1306; flush() вместо display() копирует готовый кадр (512 байт) и сразу
+// возвращается, а задача отправляет его по I²C (~12,7 мс). Пока она ждёт шину, процессор
+// свободен для loop() — такты и MIDI-вход не стоят на время передачи. Если следующий кадр
+// готов раньше, чем ушёл текущий, отправляется самый свежий; кадр, совпадающий с уже
+// отправленным, не передаётся вовсе.
+class RedSeaDisplay : public Adafruit_SSD1306 {
+public:
+  using Adafruit_SSD1306::Adafruit_SSD1306;
+
+  void startSender() {
+    xTaskCreate(senderTask, "oled", 3072, this, 2, &task);  // выше loop() (приоритет 1)
+  }
+
+  void flush() {
+    if (!task) { display(); return; }  // до запуска задачи (setup) — как раньше
+    portENTER_CRITICAL(&mux);
+    memcpy(pending, getBuffer(), FRAME_BYTES);
+    hasPending = true;
+    portEXIT_CRITICAL(&mux);
+    xTaskNotifyGive(task);
+  }
+
+  // Дождаться, пока все отданные кадры уйдут (для прямой работы с шиной в обход задачи).
+  void waitIdle() {
+    while (task && (hasPending || sendingNow)) vTaskDelay(1);
+  }
+
+private:
+  static constexpr uint16_t FRAME_BYTES = Display::W * Display::H / 8;
+  uint8_t pending[FRAME_BYTES];
+  uint8_t sending[FRAME_BYTES];
+  uint8_t lastSent[FRAME_BYTES];
+  volatile bool hasPending = false;
+  volatile bool sendingNow = false;
+  bool hasLastSent = false;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+  TaskHandle_t task = nullptr;
+
+  static void senderTask(void* arg) {
+    RedSeaDisplay* d = static_cast<RedSeaDisplay*>(arg);
+    for (;;) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      for (;;) {
+        portENTER_CRITICAL(&d->mux);
+        if (!d->hasPending) { portEXIT_CRITICAL(&d->mux); break; }
+        memcpy(d->sending, d->pending, FRAME_BYTES);
+        d->hasPending = false;
+        d->sendingNow = true;
+        portEXIT_CRITICAL(&d->mux);
+        if (!d->hasLastSent || memcmp(d->sending, d->lastSent, FRAME_BYTES) != 0) {
+          d->sendFrame(d->sending);
+          memcpy(d->lastSent, d->sending, FRAME_BYTES);
+          d->hasLastSent = true;
+        }
+        d->sendingNow = false;
+      }
+    }
+  }
+
+  // То же, что Adafruit_SSD1306::display() для I²C, но из переданного буфера.
+  void sendFrame(const uint8_t* buf) {
+    static const uint8_t addressing[] = {SSD1306_PAGEADDR, 0, 0xFF, SSD1306_COLUMNADDR};
+    const uint16_t chunk = min(256, I2C_BUFFER_LENGTH);
+    wire->setClock(wireClk);
+    ssd1306_commandList(addressing, sizeof(addressing));
+    ssd1306_command1(0);
+    ssd1306_command1(Display::W - 1);
+    wire->beginTransmission(i2caddr);
+    wire->write((uint8_t)0x40);
+    uint16_t bytesOut = 1;
+    for (uint16_t i = 0; i < FRAME_BYTES; i++) {
+      if (bytesOut >= chunk) {
+        wire->endTransmission();
+        wire->beginTransmission(i2caddr);
+        wire->write((uint8_t)0x40);
+        bytesOut = 1;
+      }
+      wire->write(buf[i]);
+      bytesOut++;
+    }
+    wire->endTransmission();
+    wire->setClock(restoreClk);
+  }
+};
+
+RedSeaDisplay display(Display::W, Display::H, &Wire, -1);
 HardwareSerial midi(1);
+
+// ------------------------------------------------------------
+// Отправка MIDI: очередь вместо прямой записи в UART.
+// Байт на 31250 бод уходит 0,32 мс; пачка CC или нот занимает миллисекунды, и
+// midi.write() при заполненном FIFO ждал бы. Поэтому сообщения встают в очередь, а
+// midiPump() (задача движка, раз в 0,5 мс) докладывает их в аппаратный FIFO понемногу.
+// Реалтайм (Clock, Start, Stop) идёт отдельной очередью вне общей и уходит следующим же
+// байтом — Clock не ждёт пачку CC; по спецификации MIDI его можно вставлять даже внутрь
+// другого сообщения.
+// ------------------------------------------------------------
+#include <hal/uart_ll.h>
+
+namespace MidiOut {
+  constexpr uint16_t RT_SIZE = 64;      // степени двойки
+  constexpr uint16_t TX_SIZE = 1024;
+  constexpr uint32_t FIFO_KEEP = 3;     // байт в FIFO UART: ~1 мс, Clock ждёт не дольше
+  uint8_t rt[RT_SIZE], tx[TX_SIZE];
+  volatile uint16_t rtHead = 0, rtTail = 0, txHead = 0, txTail = 0;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+}
+
+void midiPump() {
+  using namespace MidiOut;
+  portENTER_CRITICAL(&mux);
+  uart_dev_t* hw = UART_LL_GET_HW(1);
+  uint32_t inFifo = UART_LL_FIFO_DEF_LEN - uart_ll_get_txfifo_len(hw);
+  while (inFifo < FIFO_KEEP) {
+    uint8_t b;
+    if (rtTail != rtHead) { b = rt[rtTail]; rtTail = (rtTail + 1) & (RT_SIZE - 1); }
+    else if (txTail != txHead) { b = tx[txTail]; txTail = (txTail + 1) & (TX_SIZE - 1); }
+    else break;
+    uart_ll_write_txfifo(hw, &b, 1);
+    inFifo++;
+  }
+  portEXIT_CRITICAL(&mux);
+}
+
+void midiRealtime(uint8_t b) {
+  using namespace MidiOut;
+  portENTER_CRITICAL(&mux);
+  uint16_t next = (rtHead + 1) & (RT_SIZE - 1);
+  if (next != rtTail) { rt[rtHead] = b; rtHead = next; }
+  portEXIT_CRITICAL(&mux);
+  midiPump();  // обычно уходит сразу
+}
+
+// Сообщение целиком — одной операцией, чтобы сообщения из задачи движка и из loop()
+// не перемешались по байтам.
+void midiMessage(uint8_t s, uint8_t d1, uint8_t d2) {
+  using namespace MidiOut;
+  for (;;) {
+    portENTER_CRITICAL(&mux);
+    uint16_t freeBytes = (txTail - txHead - 1) & (TX_SIZE - 1);
+    if (freeBytes >= 3) {
+      tx[txHead] = s; txHead = (txHead + 1) & (TX_SIZE - 1);
+      tx[txHead] = d1; txHead = (txHead + 1) & (TX_SIZE - 1);
+      tx[txHead] = d2; txHead = (txHead + 1) & (TX_SIZE - 1);
+    }
+    portEXIT_CRITICAL(&mux);
+    if (freeBytes >= 3) break;
+    midiPump();               // очередь полна (~340 сообщений) — ждём, пока UART освободит место
+    delayMicroseconds(100);
+  }
+  midiPump();
+}
+
+// Задача движка (см. «Движок» ниже) и loop() делят состояние. Всё, что меняет его из loop()
+// (кнопки, энкодер, сбросы, сохранение), выполняется под этой блокировкой. Отрисовка только
+// читает состояние и идёт без неё — иначе такты снова ждали бы кадр.
+SemaphoreHandle_t engineMutex = nullptr;
+inline void engineLock()   { if (engineMutex) xSemaphoreTakeRecursive(engineMutex, portMAX_DELAY); }
+inline void engineUnlock() { if (engineMutex) xSemaphoreGiveRecursive(engineMutex); }
 Preferences storage;
 
 // ============================================================
@@ -185,7 +343,7 @@ struct State {
   uint8_t sequencerSteps = 16;
   uint8_t sequencerScaleIndex = 0;
   uint8_t sequencerCC = 00;
-  uint8_t sequencerBPM = 120;
+  uint16_t sequencerBPM = 120;  // 1..300 — в uint8_t не помещается
   uint8_t sequencerCursor = 0;
   uint8_t sequencerPlayhead = 0;
   // Шаг, который реально триггерится/подсвечивается на этом тике.
@@ -197,6 +355,15 @@ struct State {
   uint8_t sequencerDisplayStep = 0;
   uint32_t sequencerLastStepTick = 0;
   bool sequencerRunning = false;
+  // Запуск: первый шаг (шаг 1, плейхед 0) звучит на ближайшем такте, а при запуске двойным
+  // TAP под внешний Clock — на ближайшей доле (см. onClockTick).
+  bool sequencerStartPending = false;
+  bool sequencerStartOnBeat = false;
+  // Нота секвенсора, которая сейчас звучит (-1 — нет): Note Off ей уходит перед следующей
+  // нотой, по Stop, при входе в BYPASS и смене канала.
+  int16_t seqSoundingNote = -1;
+  // millis() последнего принятого 0xF8 — внешний Clock «жив», даже если не было Start.
+  uint32_t extClockLastMs = 0;
 
   // Retrigger
   bool retriggerActive[4] = {false};
@@ -406,6 +573,15 @@ inline uint8_t getNoise(uint8_t x, uint8_t y, uint32_t time) {
   return (h ^ (h >> 16)) & 0xFF;
 }
 
+// Синус и косинус для анимаций, аргумент которых растёт со временем работы. sinf/cosf
+// из newlib для аргумента больше ~200 переходят на точное, но очень медленное приведение
+// к периоду (у ESP32-C3 нет FPU): через ~3 минуты после включения кадр MAIN дорожал с
+// ~6 до ~32 мс. Здесь большой аргумент сначала приводится к одному периоду через fmod —
+// это быстро; до 200 вычисление в точности прежнее.
+inline float animSin(float a) { if (fabsf(a) > 200.0f) a = fmodf(a, 6.2831853f); return sin(a); }
+inline float animCos(float a) { if (fabsf(a) > 200.0f) a = fmodf(a, 6.2831853f); return cos(a); }
+inline double animCos(double a) { if (fabs(a) > 200.0) a = fmod(a, 6.283185307179586); return cos(a); }
+
 inline uint32_t getAnimTime() {
   if (state.animationPaused) return state.frozenAnimTime;
   return millis() - state.animationTimeOffset;
@@ -491,17 +667,17 @@ void midiNoteToString(uint8_t note, char* out) {
 void sendCC(uint8_t cc, uint8_t val) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0xB0 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(cc & 0x7F); midi.write(val & 0x7F);
+  midiMessage(status, cc & 0x7F, val & 0x7F);
 }
 void sendNoteOn(uint8_t note, uint8_t vel) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0x90 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(note & 0x7F); midi.write(vel & 0x7F);
+  midiMessage(status, note & 0x7F, vel & 0x7F);
 }
 void sendNoteOff(uint8_t note) {
   if (state.bypassMode == BypassMode::BYPASS) return;
   uint8_t status = 0x80 | ((state.midiChannel - 1) & 0x0F);
-  midi.write(status); midi.write(note & 0x7F); midi.write(0);
+  midiMessage(status, note & 0x7F, 0);
 }
 
 inline int getRandomAmount() {
@@ -860,6 +1036,35 @@ void exitGlobalFreeze() {
   }
 }
 
+// Нота секвенсора звучит до следующей ноты (в том числе через пустые шаги): перед новым
+// Note On гасим звучащую — сначала Off, потом On; та же нота перезапускается.
+void seqNoteOn(uint8_t note) {
+  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
+  sendNoteOn(note, 100);
+  // В BYPASS выход заглушён: нота на самом деле не ушла, и гасить её потом не нужно.
+  state.seqSoundingNote = (state.bypassMode == BypassMode::BYPASS) ? -1 : note;
+}
+
+// Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на канале.
+void seqNotesOff(bool allNotesOff) {
+  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
+  state.seqSoundingNote = -1;
+  if (allNotesOff) sendCC(123, 0);
+}
+
+// Погасить всё, что звучит: ноту секвенсора и ноты арпеджио RFLCT (перед тем как выход
+// заглушит BYPASS или сменится канал — иначе ноты повиснут).
+void releaseSoundingNotes() {
+  seqNotesOff(false);
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) stopSunArp(i);
+}
+
+void setMidiChannel(uint8_t ch) {
+  if (ch == state.midiChannel) return;
+  releaseSoundingNotes();  // Note Off уходит на прежнем канале
+  state.midiChannel = ch;
+}
+
 void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
   if (stepIndex >= state.sequencerSteps) return;
   uint32_t now = millis();
@@ -869,8 +1074,7 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
       else state.triggerTime[p] = now;
       switch (p) {
         case 0:
-          if (retrigger) sendNoteOff(state.steps[stepIndex].note);
-          sendNoteOn(state.steps[stepIndex].note, 100);
+          seqNoteOn(state.steps[stepIndex].note);
           // Метка тика для проверки строгого совпадения по тику у
           // арпеджиатора RFLCT (см. sunArp / mutateParam).
           state.lastNoteOnTick = state.midiTicks;
@@ -909,11 +1113,25 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
 // ============================================================
 uint32_t lastInternalTickMicros = 0;
 
+// Внешний Clock ведёт такты: после Start/Continue или пока приходят 0xF8 (многие DAW шлют
+// Clock и в стопе, без Start). Тогда внутренние такты не генерируются — иначе обе
+// последовательности шли бы в один счётчик и темп складывался.
+bool externalClockActive() {
+  return state.midiRunning || (state.extClockLastMs && millis() - state.extClockLastMs < 300);
+}
+
 // Генерирует синтетический тик MIDI-клока (24 ppqn) из
 // state.sequencerBPM, когда нет внешнего клока. Возвращает true
 // не чаще одного раза за проход границы тика — это ЕДИНСТВЕННОЕ,
 // что должно управлять привязанной к темпу логикой во внутреннем
 // режиме.
+uint32_t internalTickPeriodUs() {
+  float bpm = state.sequencerBPM;
+  if (bpm < 1) bpm = 120;
+  float tickPeriodUs = (60.0f / bpm) * 1000000.0f / 24.0f;
+  return (uint32_t)tickPeriodUs;
+}
+
 bool generateInternalTicks() {
   if (!state.sequencerRunning) return false;
   uint32_t now = micros();
@@ -921,10 +1139,7 @@ bool generateInternalTicks() {
     lastInternalTickMicros = now;
     return false;
   }
-  float bpm = state.sequencerBPM;
-  if (bpm < 1) bpm = 120;
-  float tickPeriodUs = (60.0f / bpm) * 1000000.0f / 24.0f;
-  uint32_t period = (uint32_t)tickPeriodUs;
+  uint32_t period = internalTickPeriodUs();
   if (now - lastInternalTickMicros >= period) {
     lastInternalTickMicros += period;
     return true;
@@ -956,13 +1171,23 @@ void onClockTick() {
   if (state.sequencerRunning) {
     uint8_t scale = scaleMultipliers[state.sequencerScaleIndex];
     uint32_t ticksPerStep = 12 * scale / 2;
-    bool tick = (state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
+    // Первый шаг после запуска играет сам шаг 1 (плейхед уже 0) на первом такте после
+    // Start, а при запуске под внешний Clock — на ближайшей доле. Доли отсчитываются от
+    // Start: первый 0xF8 после него — сильная доля, то есть такты 1, 25, 49…
+    bool firstStep = false;
+    if (state.sequencerStartPending &&
+        (!state.sequencerStartOnBeat || state.midiTicks % 24 == 1)) {
+      state.sequencerStartPending = false;
+      firstStep = true;
+    }
+    bool tick = firstStep || (!state.sequencerStartPending &&
+                              state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
     if (tick) {
       state.sequencerLastStepTick = state.midiTicks;
       // Реальный плейхед продвигается всегда, независимо от FREEZE —
       // это и даёт бесшовное продолжение после выхода из режима
       // (см. комментарий у sequencerDisplayStep).
-      state.sequencerPlayhead = (state.sequencerPlayhead + 1) % state.sequencerSteps;
+      if (!firstStep) state.sequencerPlayhead = (state.sequencerPlayhead + 1) % state.sequencerSteps;
       // Во FREEZE триггерим и подсвечиваем шаг под курсором, не
       // трогая при этом настоящий плейхед выше.
       uint8_t newPlayhead = (state.bypassMode == BypassMode::FREEZE)
@@ -996,7 +1221,7 @@ void onClockTick() {
       uint32_t elapsed = state.midiTicks - state.retrigLastTickGlobal;
       for (uint8_t p = 0; p < 4; p++) {
         if (state.retriggerActive[p] && elapsed >= interval) {
-          if (p == 0) { sendNoteOff(state.lastNote); sendNoteOn(state.lastNote, 100); state.lastNoteOnTick = state.midiTicks; }
+          if (p == 0) { seqNoteOn(state.lastNote); state.lastNoteOnTick = state.midiTicks; }
           if (p == 1) sendCC(state.sequencerCC, state.lastCC);
           if (p == 2) {
             uint8_t val = state.lastWavesIndex;
@@ -1027,7 +1252,9 @@ void onClockTick() {
       // RAIN: у каждого параметра свой, расстроенный от клока по
       // DRIP тайминг капель (см. processRainDrops), плюс THNDR.
       processRainDrops(interval);
-    } else if (state.midiTicks % interval == 0) {
+    } else if (state.weatherMode != WeatherMode::FOG && state.midiTicks % interval == 0) {
+      // FOG сюда не входит: его параметры ведёт LFO ниже, и случайный сдвиг на том же
+      // такте давал лишний CC прямо перед значением LFO.
       for (uint8_t i = 0; i < NUM_PARAMS; i++) mutateParam(i);
     }
   }
@@ -1060,6 +1287,7 @@ void onClockTick() {
       int delta = (int)(state.lfoCurrentValue * amp * halfRange);
       int newVal = center + delta;
       newVal = clampU8(newVal, state.params[i].min, state.params[i].max);
+      if (newVal == state.params[i].value) continue;  // CC — только при изменении значения
       state.params[i].value = newVal;
       sendCC(state.params[i].cc, newVal);
     }
@@ -1071,6 +1299,7 @@ void onClockTick() {
 // затем прогоняет общую per-tick логику через onClockTick().
 void processExternalClockTick() {
   uint32_t now = micros();
+  state.extClockLastMs = millis();
   if (state.lastClockMicros) {
     uint32_t delta = now - state.lastClockMicros;
     if (delta > 500 && delta < 100000) {
@@ -1125,6 +1354,20 @@ void handleIncomingCC(uint8_t cc, uint8_t val) {
   state.displayDirty = true;
 }
 
+// Расписания движков (капли RAIN, повторы RFLCT, заморозки SNOW) хранят абсолютные номера
+// тактов. Start обнуляет счётчик тактов — переносим их к новому нулю, сохраняя оставшееся
+// время; иначе движок ждал бы, пока счётчик дорастёт до номера из прошлого прогона.
+void rebaseTickSchedules(uint32_t oldTicks) {
+  auto rebase = [oldTicks](uint32_t& t) { t = (t > oldTicks) ? t - oldTicks : 0; };
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+    rebase(state.rainNextTick[i]);
+    rebase(state.sunReflectNextTick[i]);
+  }
+  for (uint8_t t = 0; t < SNOW_FREEZE_TARGETS; t++) rebase(state.snowFreezeUntilTick[t]);
+  rebase(state.snowLastStepTick);
+  rebase(state.lastNoteOnTick);
+}
+
 void processMIDI() {
   uint8_t count = 0;
   while (midi.available() && count < 64) {
@@ -1140,16 +1383,20 @@ void processMIDI() {
         case 0xF8: processExternalClockTick(); break;
         case 0xFA:
           state.midiRunning = true;
+          rebaseTickSchedules(state.midiTicks);
           state.midiTicks = 0; state.beatCounter = 0; state.barCounter = 0;
           state.lastClockMicros = 0; state.clockAccumulator = 0; state.clockCount = 0; state.bpmSmooth = 0;
           state.sequencerRunning = true;
           // Start приводит секвенсор в то же чистое состояние, что и Stop.
           resetSequencerState();
+          state.sequencerStartPending = true;   // шаг 1 — на первом 0xF8 после Start
+          state.sequencerStartOnBeat = false;
           break;
         case 0xFB: state.midiRunning = true; state.sequencerRunning = true; break;
         case 0xFC:
           state.midiRunning = false;
           state.sequencerRunning = false;
+          seqNotesOff(true);
           resetSequencerState();
           break;
       }
@@ -1240,29 +1487,30 @@ void updateButtons() {
         // Нажатие
         if (b.processed) continue;
 
+        // Ожидание MIDI Learn отменяет любая кнопка. PAGE и ENC_SW обрабатывают это ниже
+        // сами; PLAY и TAP здесь только отменяют ожидание — без переключения BYPASS/FREEZE
+        // и транспорта.
+        if (state.midiLearnActive && (i == 0 || i == 1)) {
+          state.midiLearnActive = false;
+          state.displayDirty = true;
+          b.processed = true;
+          continue;
+        }
+
         if (i == 1) {
           if (tapWasReleased && (millis() - state.lastTapReleaseTime) < DOUBLE_CLICK_TIME && !state.tapDoubleClicked) {
-            if (state.midiRunning) {
-              state.sequencerRunning = !state.sequencerRunning;
-              if (state.sequencerRunning) {
-                state.sequencerPlayhead = 0;
-                state.sequencerDisplayStep = 0;
-                state.sequencerLastStepTick = state.midiTicks;
-              } else {
-                lastInternalTickMicros = 0;
-                resetSequencerState();
-              }
+            state.sequencerRunning = !state.sequencerRunning;
+            if (state.sequencerRunning) {
+              // Шаг 1 — на ближайшем такте; под внешний Clock — на ближайшей доле.
+              resetSequencerState();
+              state.sequencerStartPending = true;
+              state.sequencerStartOnBeat = externalClockActive();
+              // Внутренний темп: RED SEA — ведущий, Start уходит наружу, первый Clock — с шагом 1.
+              if (!state.sequencerStartOnBeat) midiRealtime(0xFA);
             } else {
-              state.sequencerRunning = !state.sequencerRunning;
-              if (state.sequencerRunning) {
-                state.sequencerPlayhead = 0;
-                state.sequencerDisplayStep = 0;
-                state.sequencerLastStepTick = 0;
-                lastInternalTickMicros = 0;
-              } else {
-                lastInternalTickMicros = 0;
-                resetSequencerState();
-              }
+              seqNotesOff(true);
+              resetSequencerState();
+              if (!externalClockActive()) midiRealtime(0xFC);
             }
             state.tapDoubleClicked = true;
             state.lastTapReleaseTime = 0;
@@ -1302,6 +1550,7 @@ void updateButtons() {
           if (buttons[1].lastStable == HIGH) {
             bool wasFreeze = (state.bypassMode == BypassMode::FREEZE);
             if (state.bypassMode == BypassMode::OFF) {
+              if (state.selectedBypassMode == BypassMode::BYPASS) releaseSoundingNotes();
               state.bypassMode = state.selectedBypassMode;
               if (state.bypassMode == BypassMode::FREEZE) enterGlobalFreeze();
             } else {
@@ -1492,15 +1741,24 @@ void checkTapPlayLongPress() {
 // ============================================================
 // 10. ОБРАБОТКА ЭНКОДЕРА
 // ============================================================
-void handleEncoder() {
-  int mov = 0;
-  if (abs(encoderTicks) >= 4) {
-    mov = (encoderTicks > 0) ? 1 : -1;
-    encoderTicks = 0;
-    state.displayDirty = true;
-  }
-  if (mov == 0) return;
+void handleEncoderDetent(int mov);
 
+// Забирает все накопленные щелчки (4 перехода квадратуры на щелчок) и обрабатывает их по
+// одному — пока кадр рисуется, их может набраться несколько, и ни один не должен теряться.
+// Неполный щелчок остаётся на следующий раз. Чтение и вычитание — под запретом прерываний,
+// иначе переход, пришедший между ними, пропал бы.
+void handleEncoder() {
+  noInterrupts();
+  int detents = encoderTicks / 4;
+  encoderTicks -= detents * 4;
+  interrupts();
+  if (detents == 0) return;
+  state.displayDirty = true;
+  int dir = (detents > 0) ? 1 : -1;
+  for (int i = 0; i != detents; i += dir) handleEncoderDetent(dir);
+}
+
+void handleEncoderDetent(int mov) {
   bool tapPressed = (buttons[1].lastStable == LOW);
 
   // SEQUENCER main
@@ -1600,7 +1858,7 @@ void handleEncoder() {
     switch (state.selectedParam) {
       case 0: {
         int v = (int)state.midiChannel + mov;
-        state.midiChannel = clampU8(v, 1, 16);
+        setMidiChannel(clampU8(v, 1, 16));
         state.needSaveGlobal = true;
         break;
       }
@@ -1718,7 +1976,7 @@ void randomizeCurrentPage() {
           state.needSaveCC = true;
         }
       } else {
-        state.midiChannel = random(1, 17);
+        setMidiChannel(random(1, 17));
         state.selectedBypassMode = (random(0, 2) == 0) ? BypassMode::BYPASS : BypassMode::FREEZE;
         state.seqDest = (SeqDest)random(0, 3);
         state.gfxEnabled = random(0, 2);
@@ -1779,7 +2037,7 @@ void randomizeCurrentPage() {
         state.sequencerScaleIndex = random(0, 4);
         if (state.sequencerCursor >= state.sequencerSteps) state.sequencerCursor = state.sequencerSteps - 1;
         if (state.sequencerPlayhead >= state.sequencerSteps) state.sequencerPlayhead = 0;
-        saveSequencerSettings();
+        // сохранится в loop() через 2 с после последнего изменения
       }
       state.displayDirty = true;
       break;
@@ -1811,7 +2069,7 @@ void randomizeSequencerAll() {
   state.lastCC = 20;
   state.lastWavesIndex = 2;
   state.displayDirty = true;
-  saveSequencerSettings();
+  // сохранится в loop() через 2 с после последнего изменения
 }
 
 void resetToDefaults() {
@@ -1844,7 +2102,7 @@ void resetToDefaults() {
         for (uint8_t i = 0; i < NUM_PARAMS; i++) state.params[i].cc = i;
         state.needSaveCC = true;
       } else if (sub == 1) {
-        state.midiChannel = 1;
+        setMidiChannel(1);
         if (state.bypassMode == BypassMode::FREEZE) exitGlobalFreeze();
         state.bypassMode = BypassMode::OFF;
         state.selectedBypassMode = BypassMode::FREEZE;
@@ -1923,7 +2181,7 @@ void resetToDefaults() {
         state.lastNote = 72;
         state.lastCC = 00;
         state.lastWavesIndex = 2;
-        saveSequencerSettings();
+        // сохранится в loop() через 2 с после последнего изменения
       } else if (sub == 1) {
         state.sequencerSteps = 16;
         state.sequencerScaleIndex = 0;
@@ -1931,10 +2189,15 @@ void resetToDefaults() {
         state.sequencerBPM = 120;
         state.sequencerCursor = 0;
         state.sequencerPlayhead = 0;
+        if (state.sequencerRunning) {
+          seqNotesOff(true);
+          if (!externalClockActive()) midiRealtime(0xFC);
+        }
         state.sequencerRunning = false;
+        state.sequencerStartPending = false;
         state.sequencerLastStepTick = 0;
         lastInternalTickMicros = 0;
-        saveSequencerSettings();
+        // сохранится в loop() через 2 с после последнего изменения
       }
       break;
     default: break;
@@ -1958,6 +2221,7 @@ void resetSequencerState() {
   state.sequencerPlayhead = 0;
   state.sequencerDisplayStep = 0;
   state.sequencerLastStepTick = 0;
+  state.sequencerStartPending = false;
   lastInternalTickMicros = 0;
   state.displayDirty = true;
 }
@@ -1988,6 +2252,11 @@ void drawDitherFill(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fillPct,
   else noiseAmt = 0.7f + (amt - 70) / 30.0f * 0.3f;
   uint16_t speed = constrain(150 - amt * 1.3f, 10, 150);
   uint8_t offset = (uint8_t)((time / speed) % 64);
+  // Пороги не зависят от пикселя — считаем один раз на столбик, а не для каждого
+  // из ~500 пикселей (у ESP32-C3 нет FPU, каждая операция float — программная).
+  float density = fillPct / 100.0f;
+  uint8_t patThreshold = (uint8_t)(56 * (1.0f - noiseAmt * 0.5f));
+  uint8_t noiseThreshold = (uint8_t)(128 * (1.0f - noiseAmt * density));
   for (uint8_t dy=0; dy<rows; dy++) {
     uint8_t py = startY + dy;
     if (py >= y+h) break;
@@ -2000,9 +2269,8 @@ void drawDitherFill(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t fillPct,
       if (amt == 0) white = true;
       else if (amt == 100) white = (noise < 128);
       else {
-        float density = fillPct / 100.0f;
-        if (pat < (uint8_t)(56 * (1.0f - noiseAmt * 0.5f))) white = true;
-        else if (noise < (uint8_t)(128 * (1.0f - noiseAmt * density))) white = true;
+        if (pat < patThreshold) white = true;
+        else if (noise < noiseThreshold) white = true;
       }
       if (white) display.drawPixel(px, py, invert ? SSD1306_BLACK : SSD1306_WHITE);
     }
@@ -2051,19 +2319,30 @@ void drawWaveform(uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t type, int8
 void drawSeaLines(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
-  uint8_t yTop = 7 + (int8_t)(sin(time / 1200.0f) * 1.5);
-  uint8_t yBottom = 17 + (int8_t)(cos(time / 1400.0f) * 1.5);
+  uint8_t yTop = 7 + (int8_t)(animSin(time / 1200.0f) * 1.5);
+  uint8_t yBottom = 17 + (int8_t)(animCos(time / 1400.0f) * 1.5);
+  // Порог по столбцу зависит только от x и AMT — таблица пересчитывается, лишь когда
+  // меняется AMT. Фаза волны от времени одна на весь кадр.
+  static uint8_t thresholds[Display::W];
+  static int16_t thresholdsAmt = -1;
+  if (thresholdsAmt != amt) {
+    for (uint8_t x=0; x<Display::W; x++) {
+      float fade = 1.0;
+      if (x < 40) fade = (float)x / 40.0;
+      else if (x > 88) fade = (float)(Display::W - x) / 40.0;
+      if (fade < 0) fade = 0;
+      thresholds[x] = (uint8_t)(30 + amt / 4 * fade);
+    }
+    thresholdsAmt = amt;
+  }
+  float wavePhase = time / 900.0f;
   for (uint8_t x=0; x<Display::W; x++) {
-    float fade = 1.0;
-    if (x < 40) fade = (float)x / 40.0;
-    else if (x > 88) fade = (float)(Display::W - x) / 40.0;
-    if (fade < 0) fade = 0;
-    int8_t waveOffset = (int8_t)(sin(x * 0.15f + time / 900.0f) * 1.2);
+    int8_t waveOffset = (int8_t)(animSin(x * 0.15f + wavePhase) * 1.2);
     uint8_t y1 = yTop + waveOffset;
     uint8_t y2 = yBottom + waveOffset;
     uint8_t patTop = bayer[(y1 + time/60) & 7][(x + time/80) & 7];
     uint8_t patBottom = bayer[(y2 + time/70) & 7][(x + time/90) & 7];
-    uint8_t threshold = (uint8_t)(30 + amt / 4 * fade);
+    uint8_t threshold = thresholds[x];
     if (patTop < threshold && y1 < Display::H) display.drawPixel(x, y1, color);
     if (patBottom < threshold && y2 < Display::H) display.drawPixel(x, y2, color);
   }
@@ -2076,8 +2355,8 @@ void drawFog(uint32_t time, uint8_t amt, bool bypass=false) {
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t layer=0; layer<1; layer++) {
     float sp = 0.4f + layer * 0.35f;
-    int8_t ox = (int8_t)(sin(slow / 3500.0f * sp + layer * 2) * (2 + layer * 2));
-    int8_t oy = (int8_t)(cos(slow / 4500.0f * sp + layer * 1.5) * (1 + layer));
+    int8_t ox = (int8_t)(animSin(slow / 3500.0f * sp + layer * 2) * (2 + layer * 2));
+    int8_t oy = (int8_t)(animCos(slow / 4500.0f * sp + layer * 1.5) * (1 + layer));
     uint8_t dens = base + layer * 6;
     for (uint8_t dy=0; dy<16; dy++) {
       for (uint8_t dx=0; dx<Display::W; dx++) {
@@ -2096,14 +2375,14 @@ void drawFog(uint32_t time, uint8_t amt, bool bypass=false) {
 void drawSun(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   uint8_t sx=82, sy=3;
-  uint8_t pulse = (uint8_t)(sin(time / 3000.0f) * 1 + 2);
+  uint8_t pulse = (uint8_t)(animSin(time / 3000.0f) * 1 + 2);
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t i=0; i<6; i++) {
     float ang = (float)i / 6 * 2 * 3.14159f + time / 6000.0f;
     uint8_t len = 1 + pulse / 4;
     for (uint8_t j=0; j<len; j++) {
-      uint8_t rx = sx + cos(ang) * len * j / len;
-      uint8_t ry = sy + sin(ang) * len * j / len;
+      uint8_t rx = sx + animCos(ang) * len * j / len;
+      uint8_t ry = sy + animSin(ang) * len * j / len;
       uint8_t pat = bayer[(ry + time/300) & 7][(rx + time/400) & 7];
       if (pat < 15 + amt/15 && rx < Display::W && ry < Display::H) display.drawPixel(rx, ry, color);
     }
@@ -2181,7 +2460,7 @@ void drawSnow(uint32_t time, uint8_t amt, bool bypass=false) {
     uint8_t r1 = (seed + i*29) & 0x0F, r2 = (seed + i*47) & 0x07;
     uint8_t fallSpeed = 6 + (r1 & 0x03);
     uint8_t px0 = i * (Display::W / num) + (r1 * 5) % (Display::W / num);
-    int8_t drift = (int8_t)(sin((fall / 500.0f) + i * 1.3f) * 2.5f);
+    int8_t drift = (int8_t)(animSin((fall / 500.0f) + i * 1.3f) * 2.5f);
     uint8_t px = (px0 + drift + Display::W) % Display::W;
     uint8_t py = ((fall / fallSpeed) + i*13 + r2) % 18;
     uint8_t pat = bayer[(py + fall/80) & 7][(px + fall/90) & 7];
@@ -2354,7 +2633,7 @@ void drawSailboat(uint8_t x, uint8_t y, uint32_t time, uint8_t amt, bool bypass=
   bool alt = ((time / 400) & 1) == 0;
   const uint8_t (*boat)[8] = alt ? sailboatAlt : sailboat;
   float wave = 1.0f + (amt / 100.0f) * 0.8f;
-  int8_t off = (int8_t)(sin(time / 800.0f * wave) * 1.5);
+  int8_t off = (int8_t)(animSin(time / 800.0f * wave) * 1.5);
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   for (uint8_t r=0; r<9; r++) {
     for (uint8_t c=0; c<8; c++) {
@@ -2482,7 +2761,7 @@ void drawMain(bool bypass) {
       }
     }
   }
-  display.display();
+  display.flush();
 }
 
 // Прямоугольная плашка поверх страницы CC на время ожидания входящего
@@ -2562,7 +2841,7 @@ void drawCC(bool bypass) {
     }
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.display();
+  display.flush();
 }
 
 // Одна снежинка: petals лучей из центра, у каждого луча — короткая
@@ -2647,7 +2926,7 @@ void drawStorm(bool bypass) {
   }
   drawColumnMode(64, wthText, state.selectedParam==2, animTime, bypass, state.frozenWth);
   drawColumnYesNo(96, state.randomizerEnabled, state.selectedParam==3, animTime, amt, bypass, state.frozenArm);
-  display.display();
+  display.flush();
 }
 
 void drawStormSubpage(bool bypass) {
@@ -2859,7 +3138,7 @@ void drawStormSubpage(bool bypass) {
     display.setCursor(10, 16);
     display.print("Coming soon...");
   }
-  display.display();
+  display.flush();
 }
 
 void drawSequencer(bool bypass) {
@@ -2975,7 +3254,7 @@ void drawSequencer(bool bypass) {
     display.getTextBounds(texts[p], 0, 0, &x1, &y1, &w, &h);
     drawTextWithOutline(x + (Display::COL_W-w)/2, my + mh - h - 1, texts[p], textColor, outlineColor);
   }
-  display.display();
+  display.flush();
 }
 
 void drawSequencerSetup(bool bypass) {
@@ -3033,7 +3312,7 @@ void drawSequencerSetup(bool bypass) {
     display.print(values[i]);
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.display();
+  display.flush();
 }
 
 // ============================================================
@@ -3050,20 +3329,23 @@ void updateDisplay() {
       display.fillScreen(bg);
       uint8_t progress = map(elapsed, 0, 150, 0, 100);
       uint8_t radius = map(progress, 0, 100, 0, 64);
+      // «Пиксель внутри круга» без корня: при целом радиусе floor(sqrt(d²)) < r
+      // равносильно d² < r². Порог узора за кадр не меняется — считаем один раз.
+      int32_t radius2 = (int32_t)radius * radius;
+      long patThreshold = map(progress, 0, 100, 0, 64);
       for (uint8_t y = 0; y < Display::H; y++) {
         for (uint8_t x = 0; x < Display::W; x++) {
           int16_t dx = x - Display::W / 2;
           int16_t dy = y - Display::H / 2;
-          uint8_t dist = sqrt(dx * dx + dy * dy);
-          if (dist < radius) {
+          if (dx * dx + dy * dy < radius2) {
             uint8_t pat = bayer[y & 7][x & 7];
-            if (pat < map(progress, 0, 100, 0, 64)) {
+            if (pat < patThreshold) {
               display.drawPixel(x, y, fg);
             }
           }
         }
       }
-      display.display();
+      display.flush();
       state.displayDirty = true;
       return;
     } else {
@@ -3150,7 +3432,7 @@ void updateDisplay() {
       }
     }
   }
-  if (needDisplay) display.display();
+  if (needDisplay) display.flush();
 }
 
 // ============================================================
@@ -3217,7 +3499,9 @@ void loadSettings() {
   state.gfxEnabled = storage.getBool("gfx", true);
   state.sequencerSteps = storage.getUChar("seqSteps", 16);
   if (state.sequencerSteps < 1 || state.sequencerSteps > 16) state.sequencerSteps = 16;
-  state.sequencerBPM = storage.getUChar("seqBPM", 120);
+  // Темп хранится 16-битным под ключом "seqBPM16"; прежние версии писали 8-битный
+  // "seqBPM" — он читается, если нового ключа ещё нет.
+  state.sequencerBPM = storage.getUShort("seqBPM16", storage.getUChar("seqBPM", 120));
   if (state.sequencerBPM < 1 || state.sequencerBPM > 300) state.sequencerBPM = 120;
   state.sequencerCC = storage.getUChar("seqCC", 20);
   state.sequencerScaleIndex = storage.getUChar("seqScale", 0);
@@ -3233,11 +3517,107 @@ void loadSettings() {
 void saveSequencerSettings() {
   storage.begin("redsea", false);
   storage.putUChar("seqSteps", state.sequencerSteps);
-  storage.putUChar("seqBPM", state.sequencerBPM);
+  storage.putUShort("seqBPM16", state.sequencerBPM);
   storage.putUChar("seqCC", state.sequencerCC);
   storage.putUChar("seqScale", state.sequencerScaleIndex);
   storage.putBytes("steps", state.steps, sizeof(state.steps));
   storage.end();
+}
+
+// ============================================================
+// Движок: такты, MIDI-вход и отправка — в отдельной задаче
+// ============================================================
+// loop() рисует экран, опрашивает кнопки и пишет настройки во флеш; всё это занимает
+// миллисекунды, и такты, которые проверялись раз за проход loop(), опаздывали на это
+// время. Задача движка с приоритетом выше loop() просыпается каждые 0,5 мс по таймеру и
+// точно к моменту очередного внутреннего такта (отдельный одноразовый таймер).
+#include <esp_timer.h>
+
+TaskHandle_t engineTask = nullptr;
+esp_timer_handle_t engineTimer = nullptr, engineTickTimer = nullptr;
+constexpr uint32_t ENGINE_PERIOD_US = 500;
+
+void onEngineTimer(void*) { if (engineTask) xTaskNotifyGive(engineTask); }
+
+void engineLoop(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+    engineLock();
+    processMIDI();
+    bool internal = state.sequencerRunning && !externalClockActive();
+    if (internal) {
+      // Обычно не больше одного такта; несколько — только если задача стояла (запись во флеш).
+      for (uint8_t n = 0; n < 8 && generateInternalTicks(); n++) {
+        midiRealtime(0xF8);  // Clock наружу: при внутреннем темпе RED SEA — ведущий
+        onClockTick();
+      }
+    } else {
+      lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
+    }
+    midiPump();
+    uint32_t last = lastInternalTickMicros;
+    uint32_t period = internalTickPeriodUs();
+    engineUnlock();
+    // Следующий такт раньше очередного пробуждения — разбудить точно к нему.
+    if (internal && last) {
+      int32_t dt = (int32_t)(last + period - micros());
+      if (dt > 0 && dt <= (int32_t)ENGINE_PERIOD_US) {
+        esp_timer_stop(engineTickTimer);
+        esp_timer_start_once(engineTickTimer, dt);
+      }
+    }
+  }
+}
+
+void engineBegin() {
+  engineMutex = xSemaphoreCreateRecursiveMutex();  // мьютекс с наследованием приоритета
+  xTaskCreate(engineLoop, "engine", 6144, nullptr, configMAX_PRIORITIES - 4, &engineTask);
+  esp_timer_create_args_t args = {};
+  args.callback = onEngineTimer;
+  args.name = "engine";
+  esp_timer_create(&args, &engineTimer);
+  args.name = "engine_tick";
+  esp_timer_create(&args, &engineTickTimer);
+  esp_timer_start_periodic(engineTimer, ENGINE_PERIOD_US);
+}
+
+// Контрольные суммы сохраняемых настроек: по ним loop() видит момент последнего
+// изменения (флаги needSave* ставятся при первом изменении и о следующих не говорят)
+// и то, изменился ли секвенсор с последнего сохранения.
+static uint32_t fnvAdd(uint32_t h, const void* data, size_t n) {
+  const uint8_t* b = (const uint8_t*)data;
+  for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+  return h;
+}
+#define FNV_FIELD(h, f) h = fnvAdd(h, &(f), sizeof(f))
+
+// Состояние логики сохранения (см. конец loop()).
+struct SaveState {
+  bool init = false;
+  uint32_t lastSig = 0, savedSig = 0, savedSeqSig = 0, lastChangeMs = 0;
+} saveState;
+
+uint32_t sequencerSignature() {
+  uint32_t h = 2166136261u;
+  h = fnvAdd(h, state.steps, sizeof(state.steps));
+  FNV_FIELD(h, state.sequencerSteps); FNV_FIELD(h, state.sequencerBPM);
+  FNV_FIELD(h, state.sequencerCC); FNV_FIELD(h, state.sequencerScaleIndex);
+  return h;
+}
+
+uint32_t settingsSignature() {
+  uint32_t h = 2166136261u;
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+    FNV_FIELD(h, state.params[i].cc); FNV_FIELD(h, state.params[i].min); FNV_FIELD(h, state.params[i].max);
+  }
+  FNV_FIELD(h, state.chaos); FNV_FIELD(h, state.waveIntervalIndex); FNV_FIELD(h, state.weatherMode);
+  FNV_FIELD(h, state.lfoType); FNV_FIELD(h, state.lfoShape); FNV_FIELD(h, state.lfoPhase); FNV_FIELD(h, state.lfoGlide);
+  FNV_FIELD(h, state.sunRflct); FNV_FIELD(h, state.sunArp); FNV_FIELD(h, state.sunDflct); FNV_FIELD(h, state.sunBias);
+  FNV_FIELD(h, state.snowFlake); FNV_FIELD(h, state.snowRotation); FNV_FIELD(h, state.snowFrz); FNV_FIELD(h, state.snowTime);
+  FNV_FIELD(h, state.rainDrip); FNV_FIELD(h, state.rainWet); FNV_FIELD(h, state.rainSplsh); FNV_FIELD(h, state.rainThunder);
+  FNV_FIELD(h, state.midiChannel); FNV_FIELD(h, state.selectedBypassMode); FNV_FIELD(h, state.seqDest);
+  FNV_FIELD(h, state.gfxEnabled);
+  return h;
 }
 
 // ============================================================
@@ -3272,11 +3652,15 @@ void setup() {
   delay(50);
   display.clearDisplay();
   display.display();
+  display.startSender();
   state.displayDirty = true;
+  engineBegin();
 }
 
 void loop() {
-  processMIDI();
+  // MIDI-вход и такты — в задаче движка (engineLoop). Здесь — интерфейс и сохранение;
+  // всё, что меняет общее состояние, под блокировкой, отрисовка — без неё.
+  engineLock();
   updateButtons();
   handleEncoder();
   checkTapPageLongPress();
@@ -3287,6 +3671,7 @@ void loop() {
     lastAnimTime = millis();
     if (state.bypassMode == BypassMode::FREEZE && !state.animationPaused) {
       state.animationPaused = true;
+      state.animationPauseTime = millis();  // от неё при выходе отсчитывается длительность паузы
       state.frozenAnimTime = millis() - state.animationTimeOffset;
     } else if (state.bypassMode == BypassMode::OFF && state.animationPaused) {
       state.animationPaused = false;
@@ -3370,20 +3755,33 @@ void loop() {
     state.tapPlayLongPressFrameVisible = false;
   }
 
+  engineUnlock();
   updateDisplay();
+  engineLock();
 
-  // Внутренний клок: per-tick логика вызывается строго один раз на
-  // настоящий тик, когда generateInternalTicks() возвращает true.
-  if (!state.midiRunning && state.sequencerRunning) {
-    if (generateInternalTicks()) {
-      onClockTick();
-    }
-  }
-
+  // Сохранение: через 2 с после последнего изменения — пока крутят энкодер, во флеш ничего
+  // не пишется. Запись останавливает процессор (~2 мс, изредка — до ~20 мс, когда NVS
+  // уплотняет сектор), поэтому, если идут такты, она делается сразу после очередного такта:
+  // до следующего — целый период (20,8 мс на 120 BPM), и такты не опаздывают.
   uint32_t now = millis();
-  if (now - state.lastSaveTime > 2000) {
+  uint32_t seqSig = sequencerSignature();
+  uint32_t sig = settingsSignature() ^ (seqSig * 31u);
+  SaveState& sv = saveState;
+  if (!sv.init) { sv.init = true; sv.lastSig = sv.savedSig = sig; sv.savedSeqSig = seqSig; sv.lastChangeMs = now; }
+  if (sig != sv.lastSig) { sv.lastSig = sig; sv.lastChangeMs = now; }
+  if (sig != sv.savedSig && now - sv.lastChangeMs >= 2000) {
+    // Каждая группа (настройки, секвенсор) пишется в свой промежуток сразу после такта:
+    // две записи подряд на быстром темпе в один промежуток не помещаются.
+    auto waitAfterTick = []() {
+      if (!state.sequencerRunning && !externalClockActive()) return;
+      uint32_t tick = state.midiTicks, waitStart = millis();
+      engineUnlock();
+      while (state.midiTicks == tick && millis() - waitStart < 250) vTaskDelay(1);
+      engineLock();
+    };
     bool needSave = state.needSaveMinMax || state.needSaveCC || state.needSaveStorm || state.needSaveGlobal;
     if (needSave) {
+      waitAfterTick();
       storage.begin("redsea", false);
       if (state.needSaveMinMax) {
         for (uint8_t i = 0; i < NUM_PARAMS; i++) {
@@ -3396,9 +3794,13 @@ void loop() {
         state.needSaveMinMax = false;
       }
       if (state.needSaveCC) {
-        char key[8];
-        sprintf(key, "cc%u", state.selectedParam);
-        storage.putUChar(key, state.params[state.selectedParam].cc);
+        // Все четыре номера: флаг один на всех, а менять их могут рандомизация, сброс и
+        // MIDI Learn, в том числе не для параметра под курсором. Неизменные NVS не перезаписывает.
+        for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+          char key[8];
+          sprintf(key, "cc%u", i);
+          storage.putUChar(key, state.params[i].cc);
+        }
         state.needSaveCC = false;
       }
       if (state.needSaveStorm) {
@@ -3432,11 +3834,12 @@ void loop() {
       }
       storage.end();
     }
-    state.lastSaveTime = now;
+    if (seqSig != sv.savedSeqSig) {
+      waitAfterTick();
+      saveSequencerSettings();
+      sv.savedSeqSig = seqSig;
+    }
+    sv.savedSig = sig;
   }
-  static uint32_t lastSequencerSave = 0;
-  if (now - lastSequencerSave > 5000) {
-    saveSequencerSettings();
-    lastSequencerSave = now;
-  }
+  engineUnlock();
 }
