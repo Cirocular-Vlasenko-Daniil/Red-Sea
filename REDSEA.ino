@@ -1122,7 +1122,9 @@ void onClockTick() {
       // RAIN: у каждого параметра свой, расстроенный от клока по
       // DRIP тайминг капель (см. processRainDrops), плюс THNDR.
       processRainDrops(interval);
-    } else if (state.midiTicks % interval == 0) {
+    } else if (state.weatherMode != WeatherMode::FOG && state.midiTicks % interval == 0) {
+      // FOG сюда не входит: его параметры ведёт LFO ниже, и случайный сдвиг на том же
+      // такте давал лишний CC прямо перед значением LFO.
       for (uint8_t i = 0; i < NUM_PARAMS; i++) mutateParam(i);
     }
   }
@@ -1155,6 +1157,7 @@ void onClockTick() {
       int delta = (int)(state.lfoCurrentValue * amp * halfRange);
       int newVal = center + delta;
       newVal = clampU8(newVal, state.params[i].min, state.params[i].max);
+      if (newVal == state.params[i].value) continue;  // CC — только при изменении значения
       state.params[i].value = newVal;
       sendCC(state.params[i].cc, newVal);
     }
