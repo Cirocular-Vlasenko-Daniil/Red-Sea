@@ -29,7 +29,93 @@ namespace Display {
   constexpr uint8_t METER_H = 20;
 }
 
-Adafruit_SSD1306 display(Display::W, Display::H, &Wire, -1);
+// Экран с передачей кадра по I²C в отдельной задаче. Отрисовка идёт как раньше, в буфер
+// Adafruit_SSD1306; flush() вместо display() копирует готовый кадр (512 байт) и сразу
+// возвращается, а задача отправляет его по I²C (~12,7 мс). Пока она ждёт шину, процессор
+// свободен для loop() — такты и MIDI-вход не стоят на время передачи. Если следующий кадр
+// готов раньше, чем ушёл текущий, отправляется самый свежий; кадр, совпадающий с уже
+// отправленным, не передаётся вовсе.
+class RedSeaDisplay : public Adafruit_SSD1306 {
+public:
+  using Adafruit_SSD1306::Adafruit_SSD1306;
+
+  void startSender() {
+    xTaskCreate(senderTask, "oled", 3072, this, 2, &task);  // выше loop() (приоритет 1)
+  }
+
+  void flush() {
+    if (!task) { display(); return; }  // до запуска задачи (setup) — как раньше
+    portENTER_CRITICAL(&mux);
+    memcpy(pending, getBuffer(), FRAME_BYTES);
+    hasPending = true;
+    portEXIT_CRITICAL(&mux);
+    xTaskNotifyGive(task);
+  }
+
+  // Дождаться, пока все отданные кадры уйдут (для прямой работы с шиной в обход задачи).
+  void waitIdle() {
+    while (task && (hasPending || sendingNow)) vTaskDelay(1);
+  }
+
+private:
+  static constexpr uint16_t FRAME_BYTES = Display::W * Display::H / 8;
+  uint8_t pending[FRAME_BYTES];
+  uint8_t sending[FRAME_BYTES];
+  uint8_t lastSent[FRAME_BYTES];
+  volatile bool hasPending = false;
+  volatile bool sendingNow = false;
+  bool hasLastSent = false;
+  portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+  TaskHandle_t task = nullptr;
+
+  static void senderTask(void* arg) {
+    RedSeaDisplay* d = static_cast<RedSeaDisplay*>(arg);
+    for (;;) {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      for (;;) {
+        portENTER_CRITICAL(&d->mux);
+        if (!d->hasPending) { portEXIT_CRITICAL(&d->mux); break; }
+        memcpy(d->sending, d->pending, FRAME_BYTES);
+        d->hasPending = false;
+        d->sendingNow = true;
+        portEXIT_CRITICAL(&d->mux);
+        if (!d->hasLastSent || memcmp(d->sending, d->lastSent, FRAME_BYTES) != 0) {
+          d->sendFrame(d->sending);
+          memcpy(d->lastSent, d->sending, FRAME_BYTES);
+          d->hasLastSent = true;
+        }
+        d->sendingNow = false;
+      }
+    }
+  }
+
+  // То же, что Adafruit_SSD1306::display() для I²C, но из переданного буфера.
+  void sendFrame(const uint8_t* buf) {
+    static const uint8_t addressing[] = {SSD1306_PAGEADDR, 0, 0xFF, SSD1306_COLUMNADDR};
+    const uint16_t chunk = min(256, I2C_BUFFER_LENGTH);
+    wire->setClock(wireClk);
+    ssd1306_commandList(addressing, sizeof(addressing));
+    ssd1306_command1(0);
+    ssd1306_command1(Display::W - 1);
+    wire->beginTransmission(i2caddr);
+    wire->write((uint8_t)0x40);
+    uint16_t bytesOut = 1;
+    for (uint16_t i = 0; i < FRAME_BYTES; i++) {
+      if (bytesOut >= chunk) {
+        wire->endTransmission();
+        wire->beginTransmission(i2caddr);
+        wire->write((uint8_t)0x40);
+        bytesOut = 1;
+      }
+      wire->write(buf[i]);
+      bytesOut++;
+    }
+    wire->endTransmission();
+    wire->setClock(restoreClk);
+  }
+};
+
+RedSeaDisplay display(Display::W, Display::H, &Wire, -1);
 HardwareSerial midi(1);
 Preferences storage;
 
@@ -2078,7 +2164,7 @@ void drawSeaLines(uint32_t time, uint8_t amt, bool bypass=false) {
     uint8_t y2 = yBottom + waveOffset;
     uint8_t patTop = bayer[(y1 + time/60) & 7][(x + time/80) & 7];
     uint8_t patBottom = bayer[(y2 + time/70) & 7][(x + time/90) & 7];
-    uint8_t threshold = (uint8_t)(30 + amt / 4 * fade);
+    uint8_t threshold = thresholds[x];
     if (patTop < threshold && y1 < Display::H) display.drawPixel(x, y1, color);
     if (patBottom < threshold && y2 < Display::H) display.drawPixel(x, y2, color);
   }
@@ -2497,7 +2583,7 @@ void drawMain(bool bypass) {
       }
     }
   }
-  display.display();
+  display.flush();
 }
 
 // Прямоугольная плашка поверх страницы CC на время ожидания входящего
@@ -2577,7 +2663,7 @@ void drawCC(bool bypass) {
     }
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.display();
+  display.flush();
 }
 
 // Одна снежинка: petals лучей из центра, у каждого луча — короткая
@@ -2662,7 +2748,7 @@ void drawStorm(bool bypass) {
   }
   drawColumnMode(64, wthText, state.selectedParam==2, animTime, bypass, state.frozenWth);
   drawColumnYesNo(96, state.randomizerEnabled, state.selectedParam==3, animTime, amt, bypass, state.frozenArm);
-  display.display();
+  display.flush();
 }
 
 void drawStormSubpage(bool bypass) {
@@ -2874,7 +2960,7 @@ void drawStormSubpage(bool bypass) {
     display.setCursor(10, 16);
     display.print("Coming soon...");
   }
-  display.display();
+  display.flush();
 }
 
 void drawSequencer(bool bypass) {
@@ -2990,7 +3076,7 @@ void drawSequencer(bool bypass) {
     display.getTextBounds(texts[p], 0, 0, &x1, &y1, &w, &h);
     drawTextWithOutline(x + (Display::COL_W-w)/2, my + mh - h - 1, texts[p], textColor, outlineColor);
   }
-  display.display();
+  display.flush();
 }
 
 void drawSequencerSetup(bool bypass) {
@@ -3048,7 +3134,7 @@ void drawSequencerSetup(bool bypass) {
     display.print(values[i]);
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.display();
+  display.flush();
 }
 
 // ============================================================
@@ -3075,13 +3161,13 @@ void updateDisplay() {
           int16_t dy = y - Display::H / 2;
           if (dx * dx + dy * dy < radius2) {
             uint8_t pat = bayer[y & 7][x & 7];
-            if (pat < map(progress, 0, 100, 0, 64)) {
+            if (pat < patThreshold) {
               display.drawPixel(x, y, fg);
             }
           }
         }
       }
-      display.display();
+      display.flush();
       state.displayDirty = true;
       return;
     } else {
@@ -3168,7 +3254,7 @@ void updateDisplay() {
       }
     }
   }
-  if (needDisplay) display.display();
+  if (needDisplay) display.flush();
 }
 
 // ============================================================
@@ -3290,6 +3376,7 @@ void setup() {
   delay(50);
   display.clearDisplay();
   display.display();
+  display.startSender();
   state.displayDirty = true;
 }
 
