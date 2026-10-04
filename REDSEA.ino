@@ -969,7 +969,8 @@ void exitGlobalFreeze() {
 void seqNoteOn(uint8_t note) {
   if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
   sendNoteOn(note, 100);
-  state.seqSoundingNote = note;
+  // В BYPASS выход заглушён: нота на самом деле не ушла, и гасить её потом не нужно.
+  state.seqSoundingNote = (state.bypassMode == BypassMode::BYPASS) ? -1 : note;
 }
 
 // Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на канале.
