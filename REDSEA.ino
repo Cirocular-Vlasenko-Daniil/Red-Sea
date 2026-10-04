@@ -283,6 +283,15 @@ struct State {
   uint8_t sequencerDisplayStep = 0;
   uint32_t sequencerLastStepTick = 0;
   bool sequencerRunning = false;
+  // Запуск: первый шаг (шаг 1, плейхед 0) звучит на ближайшем такте, а при запуске двойным
+  // TAP под внешний Clock — на ближайшей доле (см. onClockTick).
+  bool sequencerStartPending = false;
+  bool sequencerStartOnBeat = false;
+  // Нота секвенсора, которая сейчас звучит (-1 — нет): Note Off ей уходит перед следующей
+  // нотой, по Stop, при входе в BYPASS и смене канала.
+  int16_t seqSoundingNote = -1;
+  // millis() последнего принятого 0xF8 — внешний Clock «жив», даже если не было Start.
+  uint32_t extClockLastMs = 0;
 
   // Retrigger
   bool retriggerActive[4] = {false};
@@ -955,6 +964,34 @@ void exitGlobalFreeze() {
   }
 }
 
+// Нота секвенсора звучит до следующей ноты (в том числе через пустые шаги): перед новым
+// Note On гасим звучащую — сначала Off, потом On; та же нота перезапускается.
+void seqNoteOn(uint8_t note) {
+  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
+  sendNoteOn(note, 100);
+  state.seqSoundingNote = note;
+}
+
+// Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на канале.
+void seqNotesOff(bool allNotesOff) {
+  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
+  state.seqSoundingNote = -1;
+  if (allNotesOff) sendCC(123, 0);
+}
+
+// Погасить всё, что звучит: ноту секвенсора и ноты арпеджио RFLCT (перед тем как выход
+// заглушит BYPASS или сменится канал — иначе ноты повиснут).
+void releaseSoundingNotes() {
+  seqNotesOff(false);
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) stopSunArp(i);
+}
+
+void setMidiChannel(uint8_t ch) {
+  if (ch == state.midiChannel) return;
+  releaseSoundingNotes();  // Note Off уходит на прежнем канале
+  state.midiChannel = ch;
+}
+
 void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
   if (stepIndex >= state.sequencerSteps) return;
   uint32_t now = millis();
@@ -964,8 +1001,7 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
       else state.triggerTime[p] = now;
       switch (p) {
         case 0:
-          if (retrigger) sendNoteOff(state.steps[stepIndex].note);
-          sendNoteOn(state.steps[stepIndex].note, 100);
+          seqNoteOn(state.steps[stepIndex].note);
           // Метка тика для проверки строгого совпадения по тику у
           // арпеджиатора RFLCT (см. sunArp / mutateParam).
           state.lastNoteOnTick = state.midiTicks;
@@ -1003,6 +1039,13 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
 // 8. ОБРАБОТКА MIDI CLOCK
 // ============================================================
 uint32_t lastInternalTickMicros = 0;
+
+// Внешний Clock ведёт такты: после Start/Continue или пока приходят 0xF8 (многие DAW шлют
+// Clock и в стопе, без Start). Тогда внутренние такты не генерируются — иначе обе
+// последовательности шли бы в один счётчик и темп складывался.
+bool externalClockActive() {
+  return state.midiRunning || (state.extClockLastMs && millis() - state.extClockLastMs < 300);
+}
 
 // Генерирует синтетический тик MIDI-клока (24 ppqn) из
 // state.sequencerBPM, когда нет внешнего клока. Возвращает true
@@ -1051,13 +1094,23 @@ void onClockTick() {
   if (state.sequencerRunning) {
     uint8_t scale = scaleMultipliers[state.sequencerScaleIndex];
     uint32_t ticksPerStep = 12 * scale / 2;
-    bool tick = (state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
+    // Первый шаг после запуска играет сам шаг 1 (плейхед уже 0) на первом такте после
+    // Start, а при запуске под внешний Clock — на ближайшей доле. Доли отсчитываются от
+    // Start: первый 0xF8 после него — сильная доля, то есть такты 1, 25, 49…
+    bool firstStep = false;
+    if (state.sequencerStartPending &&
+        (!state.sequencerStartOnBeat || state.midiTicks % 24 == 1)) {
+      state.sequencerStartPending = false;
+      firstStep = true;
+    }
+    bool tick = firstStep || (!state.sequencerStartPending &&
+                              state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
     if (tick) {
       state.sequencerLastStepTick = state.midiTicks;
       // Реальный плейхед продвигается всегда, независимо от FREEZE —
       // это и даёт бесшовное продолжение после выхода из режима
       // (см. комментарий у sequencerDisplayStep).
-      state.sequencerPlayhead = (state.sequencerPlayhead + 1) % state.sequencerSteps;
+      if (!firstStep) state.sequencerPlayhead = (state.sequencerPlayhead + 1) % state.sequencerSteps;
       // Во FREEZE триггерим и подсвечиваем шаг под курсором, не
       // трогая при этом настоящий плейхед выше.
       uint8_t newPlayhead = (state.bypassMode == BypassMode::FREEZE)
@@ -1091,7 +1144,7 @@ void onClockTick() {
       uint32_t elapsed = state.midiTicks - state.retrigLastTickGlobal;
       for (uint8_t p = 0; p < 4; p++) {
         if (state.retriggerActive[p] && elapsed >= interval) {
-          if (p == 0) { sendNoteOff(state.lastNote); sendNoteOn(state.lastNote, 100); state.lastNoteOnTick = state.midiTicks; }
+          if (p == 0) { seqNoteOn(state.lastNote); state.lastNoteOnTick = state.midiTicks; }
           if (p == 1) sendCC(state.sequencerCC, state.lastCC);
           if (p == 2) {
             uint8_t val = state.lastWavesIndex;
@@ -1169,6 +1222,7 @@ void onClockTick() {
 // затем прогоняет общую per-tick логику через onClockTick().
 void processExternalClockTick() {
   uint32_t now = micros();
+  state.extClockLastMs = millis();
   if (state.lastClockMicros) {
     uint32_t delta = now - state.lastClockMicros;
     if (delta > 500 && delta < 100000) {
@@ -1258,11 +1312,14 @@ void processMIDI() {
           state.sequencerRunning = true;
           // Start приводит секвенсор в то же чистое состояние, что и Stop.
           resetSequencerState();
+          state.sequencerStartPending = true;   // шаг 1 — на первом 0xF8 после Start
+          state.sequencerStartOnBeat = false;
           break;
         case 0xFB: state.midiRunning = true; state.sequencerRunning = true; break;
         case 0xFC:
           state.midiRunning = false;
           state.sequencerRunning = false;
+          seqNotesOff(true);
           resetSequencerState();
           break;
       }
@@ -1365,27 +1422,15 @@ void updateButtons() {
 
         if (i == 1) {
           if (tapWasReleased && (millis() - state.lastTapReleaseTime) < DOUBLE_CLICK_TIME && !state.tapDoubleClicked) {
-            if (state.midiRunning) {
-              state.sequencerRunning = !state.sequencerRunning;
-              if (state.sequencerRunning) {
-                state.sequencerPlayhead = 0;
-                state.sequencerDisplayStep = 0;
-                state.sequencerLastStepTick = state.midiTicks;
-              } else {
-                lastInternalTickMicros = 0;
-                resetSequencerState();
-              }
+            state.sequencerRunning = !state.sequencerRunning;
+            if (state.sequencerRunning) {
+              // Шаг 1 — на ближайшем такте; под внешний Clock — на ближайшей доле.
+              resetSequencerState();
+              state.sequencerStartPending = true;
+              state.sequencerStartOnBeat = externalClockActive();
             } else {
-              state.sequencerRunning = !state.sequencerRunning;
-              if (state.sequencerRunning) {
-                state.sequencerPlayhead = 0;
-                state.sequencerDisplayStep = 0;
-                state.sequencerLastStepTick = 0;
-                lastInternalTickMicros = 0;
-              } else {
-                lastInternalTickMicros = 0;
-                resetSequencerState();
-              }
+              seqNotesOff(true);
+              resetSequencerState();
             }
             state.tapDoubleClicked = true;
             state.lastTapReleaseTime = 0;
@@ -1425,6 +1470,7 @@ void updateButtons() {
           if (buttons[1].lastStable == HIGH) {
             bool wasFreeze = (state.bypassMode == BypassMode::FREEZE);
             if (state.bypassMode == BypassMode::OFF) {
+              if (state.selectedBypassMode == BypassMode::BYPASS) releaseSoundingNotes();
               state.bypassMode = state.selectedBypassMode;
               if (state.bypassMode == BypassMode::FREEZE) enterGlobalFreeze();
             } else {
@@ -1732,7 +1778,7 @@ void handleEncoderDetent(int mov) {
     switch (state.selectedParam) {
       case 0: {
         int v = (int)state.midiChannel + mov;
-        state.midiChannel = clampU8(v, 1, 16);
+        setMidiChannel(clampU8(v, 1, 16));
         state.needSaveGlobal = true;
         break;
       }
@@ -1850,7 +1896,7 @@ void randomizeCurrentPage() {
           state.needSaveCC = true;
         }
       } else {
-        state.midiChannel = random(1, 17);
+        setMidiChannel(random(1, 17));
         state.selectedBypassMode = (random(0, 2) == 0) ? BypassMode::BYPASS : BypassMode::FREEZE;
         state.seqDest = (SeqDest)random(0, 3);
         state.gfxEnabled = random(0, 2);
@@ -1976,7 +2022,7 @@ void resetToDefaults() {
         for (uint8_t i = 0; i < NUM_PARAMS; i++) state.params[i].cc = i;
         state.needSaveCC = true;
       } else if (sub == 1) {
-        state.midiChannel = 1;
+        setMidiChannel(1);
         if (state.bypassMode == BypassMode::FREEZE) exitGlobalFreeze();
         state.bypassMode = BypassMode::OFF;
         state.selectedBypassMode = BypassMode::FREEZE;
@@ -2063,7 +2109,9 @@ void resetToDefaults() {
         state.sequencerBPM = 120;
         state.sequencerCursor = 0;
         state.sequencerPlayhead = 0;
+        if (state.sequencerRunning) seqNotesOff(true);
         state.sequencerRunning = false;
+        state.sequencerStartPending = false;
         state.sequencerLastStepTick = 0;
         lastInternalTickMicros = 0;
         saveSequencerSettings();
@@ -2090,6 +2138,7 @@ void resetSequencerState() {
   state.sequencerPlayhead = 0;
   state.sequencerDisplayStep = 0;
   state.sequencerLastStepTick = 0;
+  state.sequencerStartPending = false;
   lastInternalTickMicros = 0;
   state.displayDirty = true;
 }
@@ -3528,10 +3577,12 @@ void loop() {
 
   // Внутренний клок: per-tick логика вызывается строго один раз на
   // настоящий тик, когда generateInternalTicks() возвращает true.
-  if (!state.midiRunning && state.sequencerRunning) {
+  if (state.sequencerRunning && !externalClockActive()) {
     if (generateInternalTicks()) {
       onClockTick();
     }
+  } else {
+    lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
   }
 
   uint32_t now = millis();
