@@ -1353,6 +1353,16 @@ void updateButtons() {
         // Нажатие
         if (b.processed) continue;
 
+        // Ожидание MIDI Learn отменяет любая кнопка. PAGE и ENC_SW обрабатывают это ниже
+        // сами; PLAY и TAP здесь только отменяют ожидание — без переключения BYPASS/FREEZE
+        // и транспорта.
+        if (state.midiLearnActive && (i == 0 || i == 1)) {
+          state.midiLearnActive = false;
+          state.displayDirty = true;
+          b.processed = true;
+          continue;
+        }
+
         if (i == 1) {
           if (tapWasReleased && (millis() - state.lastTapReleaseTime) < DOUBLE_CLICK_TIME && !state.tapDoubleClicked) {
             if (state.midiRunning) {
