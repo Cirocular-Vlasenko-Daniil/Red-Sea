@@ -12,7 +12,7 @@ This firmware was developed for the **ESPidi** hardware platform, designed by **
 4. [CC page](#4-cc-page)
 5. [STORM page](#5-storm-page)
 6. [SEQUENCER page](#6-sequencer-page)
-7. [The four weather engines](#7-the-four-weather-engines)
+7. [The five weather engines](#7-the-five-weather-engines)
 8. [Performance modes — BYPASS & FREEZE](#8-performance-modes--bypass--freeze)
 9. [MIDI Learn](#9-midi-learn)
 10. [Freezing parameters](#10-freezing-parameters)
@@ -31,7 +31,7 @@ RED SEA has four buttons and one push-encoder.
 | **TAP** | Sequencer transport + "hold" modifier for other buttons |
 | **PAGE** | Cycles pages (or subpages, held with TAP) |
 | **ENC_SW** | Encoder push button — select / toggle / freeze / MIDI Learn, depending on click count |
-| **Encoder** | Turn to edit the selected value; hold TAP while turning for a coarser step |
+| **Encoder** | Turn to edit the selected value. With TAP held: a coarser step, or the column's second value on MAIN and CC. With PLAY held in FREEZE: Freeze Roll |
 
 Holding **TAP** while pressing another button changes what that button does almost everywhere in the UI — it's the universal "shift" key. Where relevant, that's called out below as *TAP+X*.
 
@@ -39,6 +39,7 @@ Holding **TAP** while pressing another button changes what that button does almo
 
 - **Press** (TAP not held): if the performance mode is off, engages it immediately — no waiting for release. If it's already on, this press turns it off immediately.
 - **Hold past 0.75s, then release**: an alternate way out of the mode — press-and-hold-and-release always turns it off, regardless of how it was entered.
+- **Hold and turn the encoder** (FREEZE): **Freeze Roll** — see [§8](#8-performance-modes--bypass--freeze). While PLAY is held, the encoder never edits parameters.
 - **PLAY+TAP** (hold TAP, release PLAY): randomizes the current page/parameter in context (see each page below) — a quick, page-scoped "surprise me."
 - **TAP+PLAY held together for 3s** (on the SEQUENCER page, step view only): randomizes every step of the sequencer — trigs and their activations. The screen border blinks starting at 1s to warn you.
 
@@ -46,7 +47,7 @@ Holding **TAP** while pressing another button changes what that button does almo
 
 - **Double-click**: start/stop the sequencer.
 - **Hold + press ENC_SW**: advances the sequencer step cursor (SEQUENCER page, step view).
-- **Hold while turning the encoder**: coarser step size on numeric edits.
+- **Hold while turning the encoder**: coarser step size on STORM and SEQUENCER. On MAIN it edits the parameter's CC number, on the MAIN subpage — **max**, on CC — **Seq Trig**.
 - **Hold while pressing PAGE**: cycles the *subpage* instead of the page; held for 3s together with PAGE, randomizes all sequencer steps (same as TAP+PLAY above).
 
 ### PAGE
@@ -62,7 +63,7 @@ Click count matters, and it's judged independently for double- and triple-clicks
 - **Single click, TAP held**: cycles which of the 4 columns is selected.
 - **Single click, TAP not held**: arms a 3-second hold. Border blinks from 1s; release before 3s and nothing happens. Hold to 3s and the current page/subpage resets to its defaults.
 - **Double-click**: on MAIN or STORM (main subpage), toggles **manual freeze** on the selected parameter. On the SEQUENCER step view, toggles that step's active flag for the selected column.
-- **Triple-click**: on the CC page (CC-number view), or on the SEQUENCER setup subpage with the CC column selected — arms **MIDI Learn** (see [§9](#9-midi-learn)).
+- **Triple-click**: on the CC page (channel view), or on the SEQUENCER setup subpage with the CC column selected — arms **MIDI Learn** (see [§9](#9-midi-learn)).
 - **Any click while MIDI Learn is waiting**: cancels it.
 
 ---
@@ -77,7 +78,7 @@ Press **PAGE** to cycle: **MAIN → CC → STORM → SEQUENCER**. Each page (exc
 
 The four live CC values, P1–P4.
 
-- **Page** — a meter per parameter, showing its current value. Turn the encoder to change the selected one directly; **[hold TAP]** for a ×12 step.
+- **Page** — a meter per parameter, showing its current value. Turn the encoder to change the selected one directly. **[Hold TAP]** and turn to set the parameter's **CC number** (0–127) instead — while TAP is held, the columns show CC numbers (`CC74`) in place of values.
 - **Subpage** — edit the **min/max range** that parameter is allowed to wander within. Turning the encoder while **[TAP]** is held edits **max**; released, it edits **min**.
 
 Double-click **[ENC_SW]** to manually freeze the selected parameter (frost animation appears on that column, and it stops responding to any modulation engine until unfrozen).
@@ -86,14 +87,27 @@ Double-click **[ENC_SW]** to manually freeze the selected parameter (frost anima
 
 ## 4. CC page
 
-Assigns which MIDI CC number each of P1–P4 actually sends.
+Routes P1–P4: which MIDI channel each one sends on, and where notes go.
 
-- **Page** — CC number per parameter (0–127). Triple-click **[ENC_SW]** to MIDI Learn the selected one instead of dialing it by hand.
+- **Page** — MIDI channel per parameter: `NO` or 1–16. The parameter's CC goes out on that channel; `NO` sends nothing at all. **[TAP]**+turn toggles **Seq Trig** for the selected column, shown as a note icon in its corner: notes are sent to every channel with Seq Trig on. Triple-click **[ENC_SW]** to MIDI Learn the selected parameter — its CC number and its channel at once.
 - **Subpage** — global settings:
-  - **CH** — MIDI channel (1–16)
+  - **LEN** — note length: `LEG` (a note sounds until the next one) or `GATE` (a note ends halfway to the next hit)
   - **BYP** — which performance mode **[PLAY]** engages: `FRZ` (FREEZE) or `BYP` (BYPASS)
   - **DST** — which target the sequencer's third column (WAV/AMT/WTH) drives
   - **GFX** — background weather animation on/off (pure cosmetics, doesn't touch the engine)
+
+Where everything goes:
+
+| Source | Channels |
+|---|---|
+| P1–P4 CC | each parameter's own channel |
+| Sequencer notes, sequencer CC column | every channel with Seq Trig on (repeated channels count once) |
+| SUN arpeggio notes (ARP) | the channel of the echoing parameter, if it has Seq Trig on |
+| TWST notes | every channel with Seq Trig on |
+
+A parameter set to `NO` sends nothing, even with Seq Trig on. If no parameter has Seq Trig on, no notes are sent.
+
+With **LEN** set to `GATE`, the "next hit" is whatever comes next for that note: the next step, the step's retrigger, the next Freeze Roll hit, the next TWST grid position, or the next SUN echo.
 
 ---
 
@@ -104,15 +118,15 @@ The heart of the algorithmic engine.
 - **Page**:
   - **AMT** — overall intensity/chaos (0–127). Scales how hard every weather engine mutates values.
   - **WAV** — base timing interval the engines mutate on, from `1/16` to a whole bar.
-  - **WTH** — which weather engine is active: **FOG / SUN / RAIN / SNOW**.
+  - **WTH** — which weather engine is active: **FOG / SUN / RAIN / SNOW / TWST**.
   - **ARM** — master on/off for the algorithmic randomizer. Turn it off to freeze the engine entirely while still editing everything by hand.
-- **Subpage** — the four parameters specific to whichever weather engine is currently selected. See [§7](#7-the-four-weather-engines).
+- **Subpage** — the four parameters specific to whichever weather engine is currently selected. See [§7](#7-the-five-weather-engines).
 
 ---
 
 ## 6. SEQUENCER page
 
-A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-step retrigger rate.
+A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-step retrigger rate. Notes and the CC column go to the Seq Trig channels ([§4](#4-cc-page)); note length follows **LEN**.
 
 - **Page** (step view) — the 16-step row along the top; the four columns below (NOTE / CC / *destination* / RTRG) edit the step under the cursor. Move the cursor with **[TAP+ENC_SW]**. Select a column with **[ENC_SW (TAP held)]**; edit it with the encoder. Double-click **[ENC_SW]** to toggle that column active on the current step.
   - **RTRG** — once a step is active, this makes it re-trigger repeatedly at a fixed subdivision (1/4 down to 1/64) for as long as the step stays active, instead of firing once.
@@ -126,9 +140,9 @@ A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-s
 
 ---
 
-## 7. The four weather engines
+## 7. The five weather engines
 
-Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STORM subpage parameters give each one a distinct personality.
+Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STORM subpage parameters give each one a distinct personality. TWST is the exception: it reacts to incoming notes instead of the clock grid.
 
 ### FOG — continuous LFO
 
@@ -157,7 +171,7 @@ Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STO
 
 When a parameter's random step would push it past its own min/max, it triggers a series of **echoes** instead of just clamping: up to `RFLCT` repeats, each one landing twice as fast as the last (half the previous interval), shown on-screen as a little stack of receding rectangles.
 
-If **ARP** isn't OFF *and* a sequencer note happened to fire on the exact same clock tick that the echo series was armed, every echo in that cascade also re-triggers that note, transposed further each time: `Same` = no transposition, `5th`/`Oct`/`2Oct` = 7/12/24 semitones **per echo**, cumulative — three echoes at `Oct` land the third one three octaves up.
+If **ARP** isn't OFF *and* a sequencer note happened to fire on the exact same clock tick that the echo series was armed, every echo in that cascade also re-triggers that note, transposed further each time: `Same` = no transposition, `5th`/`Oct`/`2Oct` = 7/12/24 semitones **per echo**, cumulative — three echoes at `Oct` land the third one three octaves up. The arpeggio plays on the channel of the echoing parameter, and only if that parameter has Seq Trig on.
 
 **DFLCT** adds an independent, unconditional chance (per mutation) to arm the same echo series even when the value didn't actually hit its clamp.
 
@@ -193,6 +207,37 @@ On every hit, P1–P4 mutate as usual (scaled by AMT) — and independently, **F
 
 **TIME** shapes how long a SNOW-triggered freeze lasts: `0` = exactly one pattern step's length; positive values grow that up toward the full pattern's length; negative values randomize the duration instead — the more negative, the wider the spread between targets.
 
+### TWST — debris from incoming notes
+
+| Param | Range | What it does |
+|---|---|---|
+| DEBR | 0–8 | Copies thrown off by each incoming note |
+| RADS | 0 / OCT / 5+8 / 2OCT / CHR | Pitches the copies can land on |
+| SCAT | 1/8 / 1/4 / 1/2 / 1 / 2 bars | Window the copies fall into |
+| GUST | 0–127 | How hard each impact knocks P1–P4 |
+
+TWST listens to the MIDI input — Note On/Off on any channel. Every incoming note plays immediately on the Seq Trig channels ([§4](#4-cc-page)), and `DEBR` copies follow it, each on a random position inside the `SCAT` window (never two on the same position), at a random pitch from `RADS`, with the same velocity. Releasing the key ends the original note; copies already in the air keep falling. The DEBR column shows the impact point with one dot per copy.
+
+**RADS**: `0` = the same note, `OCT` = ±1 octave, `5+8` = ±fifth or ±octave, `2OCT` = ±1 or ±2 octaves, `CHR` = any semitone within ±1 octave. Octaves and fifths fit any key; `CHR` is for chaos.
+
+**SCAT** sets the window and its grid at once: the window is split into 16 positions (8 at `1/8`), never finer than 1/64.
+
+| SCAT | Grid | Feel |
+|---|---|---|
+| 1/8 | 1/64 | a tight burst right after the hit, almost a ratchet |
+| 1/4 | 1/64 | a fast scatter |
+| 1/2 | 1/32 | a wider scatter |
+| 1 | 1/16 | separate drops across the bar |
+| 2 | 1/8 | sparse fragments |
+
+**GUST**: every impact — the original note and each copy — hits the next of P1–P4 in turn (P1 → P2 → P3 → P4 → P1). The hit parameter jumps away from its base value by up to GUST × AMT, up or down within its min/max, and glides back to the base over the `WAV` time. GUST 0 leaves the CCs alone; manually frozen parameters are skipped. P1–P4 don't mutate on the clock grid in TWST — only impacts move them.
+
+Note length follows **LEN**: in `LEG` a copy lasts until the next grid position, in `GATE` half of that.
+
+TWST runs on time rather than on clock ticks, so it works with the sequencer stopped — the tempo then comes from the internal BPM, or from the external clock when one is present. In FREEZE every hit scatters in the same pattern. With ARM off, the original notes still play, but there are no copies and no GUST. At most 16 copies are in the air at once; extra ones are dropped. Leaving TWST or engaging BYPASS stops everything that's sounding or scheduled.
+
+Incoming notes are used only by TWST; the other engines ignore them, and RED SEA has no MIDI thru.
+
 ---
 
 ## 8. Performance modes — BYPASS & FREEZE
@@ -207,6 +252,19 @@ Mutes **all** outgoing MIDI — nothing leaves the device. The algorithmic engin
 
 Freezes **all eight** targets at once (P1–P4, AMT, WAV, WTH, ARM) — inverting whatever was already frozen, so anything you'd frozen by hand stays consistent when you exit. While active, the sequencer stops advancing and instead **loops the step under the cursor**, at the tempo set by `SCALE`. The whole screen inverts and shows a "FROZEN" banner (except on the SEQUENCER page, where the normal header stays visible so you can watch the loop).
 
+### Freeze Roll
+
+While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `ROLL`, the current rate, and the scale `4 8 16 32 64 128` with the current rate highlighted.
+
+- The first click starts from what's playing now — the step length (1/16 × SCALE) or the step's retrigger, whichever is faster — and moves it one notch.
+- Hits are timed against the sequencer's grid: after a rate change, the next hit lands on the nearest division of the new grid. 1/64 and 1/128 are exact even though they fall between MIDI clock ticks.
+- The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; rates out of reach are dimmed on the scale.
+- `EMPTY` in the window means nothing is active on the step.
+- The roll stops when you release PLAY, after 2 seconds without turning, or when FREEZE turns off. Nothing is saved — the step's retrigger stays as it was.
+- Like the FREEZE loop itself, the roll plays only while the sequencer is running.
+
+The roll is a hold gesture: press PLAY (FREEZE engages), keep holding, turn. If FREEZE is already latched, the next PLAY press turns it off, so press once to exit and then press and hold. While PLAY is held, the encoder doesn't edit parameters, and the PLAY+TAP / TAP+PLAY randomize gestures don't fire after a roll.
+
 ### Entering & exiting
 
 - **Press PLAY**: if off, turns on instantly. If already on, turns off instantly — a second press is the fastest way out.
@@ -217,11 +275,11 @@ Freezes **all eight** targets at once (P1–P4, AMT, WAV, WTH, ARM) — invertin
 
 ## 9. MIDI Learn
 
-Instead of dialing in a CC number by hand, grab it straight from your controller.
+Instead of dialing in a CC number and channel by hand, grab them straight from your controller — or from the device you want to control: turn a knob on a drum machine track connected to the MIDI input, and the parameter will send exactly there.
 
 **Triple-click ENC_SW** on:
-- the CC page (CC-number view) — learns the number for the parameter under the cursor, or
-- the SEQUENCER setup subpage, with the CC column selected — learns the sequencer's CC number.
+- the CC page (channel view) — learns both the CC number and the channel for the parameter under the cursor, or
+- the SEQUENCER setup subpage, with the CC column selected — learns the sequencer's CC number (only the number: the sequencer CC goes to the Seq Trig channels).
 
 A banner reading *"Waiting for midi data"* appears. Move a control on whatever's connected to the MIDI input — the next Control Change message received (on any channel) is captured, assigned, and the banner disappears. Any button press cancels the wait without assigning anything, and leaving the page does the same automatically.
 
@@ -240,7 +298,9 @@ Any of P1–P4, AMT, WAV, WTH, or ARM can be frozen independently.
 
 ## 11. Settings & persistence
 
-Everything — CC assignments, min/max ranges, weather engine parameters, sequencer pattern, global settings — is written to flash a couple of seconds after you stop changing it, and reloaded on boot. Power off mid-edit and nothing is lost.
+Everything — CC assignments, channels and Seq Trig, min/max ranges, weather engine parameters, sequencer pattern, global settings — is written to flash a couple of seconds after you stop changing it, and reloaded on boot. Power off mid-edit and nothing is lost.
+
+Updating from the first release: the old global MIDI channel is copied to all four parameters on first boot, Seq Trig is on for all of them and LEN is `LEG`, so the device behaves as before.
 
 ---
 
@@ -255,9 +315,10 @@ Everything — CC assignments, min/max ranges, weather engine parameters, sequen
 | ENC_SW (TAP held)             | Cycle selected column                                       |
 | ENC_SW (TAP free), hold 3s    | Reset current page/subpage to defaults                      |
 | ENC_SW double-click           | Manual freeze (MAIN/STORM) / toggle step column (SEQUENCER) |
-| ENC_SW triple-click           | MIDI Learn (CC page / sequencer CC)                         |
+| ENC_SW triple-click           | MIDI Learn (CC page — number + channel / sequencer CC)      |
 | PLAY press                    | Engage/exit BYPASS or FREEZE instantly                      |
 | PLAY hold 0.75s + release     | Exit BYPASS/FREEZE                                          |
+| PLAY hold + encoder turn      | Freeze Roll (in FREEZE)                                     |
 | PLAY+TAP                      | Randomize current page/parameter                            |
 | TAP+PLAY or TAP+PAGE, hold 3s | Randomize all sequencer steps                               |
-| Encoder turn (TAP held)       | Coarse step                                                 |
+| Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (CC) |
