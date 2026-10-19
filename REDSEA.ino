@@ -3319,7 +3319,7 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
   }
 }
 
-// Лампа ударов ролла (7×7 справа от «ROLL»). Пока удар длиннее двух кадров экрана, она
+// Лампа ударов ролла (7×7 справа от заголовка). Пока удар длиннее двух кадров экрана, она
 // мигает честно — горит первую половину каждого удара. Быстрее экран мигать не успевает
 // (вышел бы стробоскоп), и лампа переходит на дизеринг, заново случайный на каждом ударе;
 // чем больше ударов приходится на кадр, тем мельче зерно: блоки 2×2 → шум по пикселю →
@@ -3357,12 +3357,12 @@ void drawRollLamp(uint8_t x, uint8_t y, uint16_t fg, uint32_t hitUs, uint8_t pha
   }
 }
 
-// Окно Freeze Roll поверх любой страницы. Сверху «ROLL», лампа ударов и размер (1/32).
+// Окно Freeze Roll поверх любой страницы. Сверху «Freeze Roll», лампа ударов и размер (1/32).
 // Ниже бар-тахометр: его длина — скорость (каждая ступень 1/4…1/128 удлиняет его на
 // шестую), стрелка на конце плавно доезжает до новой ступени. Внутри бара — огибающие нот:
 // каждая выходит из стрелки и уезжает влево, окно — одна доля, так что чем мельче размер,
 // тем гуще зубцы; в GATE между ними паузы. Под баром шкала 4…128, текущая ступень
-// инвертирована. MAX — частота упёрлась в то, что успевает MIDI-линия.
+// инвертирована; ступени, которые MIDI-линия сейчас не успевает, приглушены.
 void drawRollOverlay(bool bypass) {
   uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
@@ -3372,8 +3372,10 @@ void drawRollOverlay(bool bypass) {
   display.setTextSize(1);
   display.setTextColor(fg);
   display.setCursor(bx + 4, by + 2);
-  display.print("ROLL");
+  display.print("Freeze Roll");
   int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds("Freeze Roll", 0, 0, &x1, &y1, &w, &h);
+  const uint8_t lampX = bx + 4 + w + 2;
   if (rollStepEmpty()) {
     display.getTextBounds("EMPTY", 0, 0, &x1, &y1, &w, &h);
     display.setCursor(bx + (bw - w) / 2, by + 12);
@@ -3403,12 +3405,8 @@ void drawRollOverlay(bool bypass) {
   uint32_t total = ticks * 1024 + sub;
   uint32_t base = (ticks % 24) * 1024 + sub;
 
-  drawRollLamp(bx + 30, by + 2, fg, (uint32_t)q * period / 4, (base % qU) * 256 / qU,
+  drawRollLamp(lampX, by + 2, fg, (uint32_t)q * period / 4, (base % qU) * 256 / qU,
                rollPosQ() / q, playing);
-  if (eff == rollMaxIndex() && eff < ROLL_STEPS - 1) {
-    display.setCursor(bx + 40, by + 2);
-    display.print("MAX");
-  }
   display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
   display.setCursor(bx + bw - 4 - w, by + 2);
   display.print(rollNames[eff]);
@@ -3438,6 +3436,7 @@ void drawRollOverlay(bool bypass) {
     if (i < ROLL_STEPS - 1 && lx[i] > lx[i + 1] - (int16_t)lw[i] - 2) lx[i] = lx[i + 1] - lw[i] - 2;
     display.drawPixel(levelX(i), bot + 1, fg);
   }
+  uint8_t maxIdx = rollMaxIndex();
   for (uint8_t i = 0; i < ROLL_STEPS; i++) {
     if (i == eff) {
       display.fillRect(lx[i] - 1, bot + 2, lw[i] + 1, 7, fg);
@@ -3447,6 +3446,11 @@ void drawRollOverlay(bool bypass) {
     }
     display.setCursor(lx[i], bot + 2);
     display.print(rollLabels[i]);
+    if (i > maxIdx) {  // недоступна сейчас — убрать каждый второй пиксель подписи
+      for (int16_t yy = bot + 2; yy < bot + 9; yy++)
+        for (int16_t xx = lx[i]; xx < lx[i] + (int16_t)lw[i]; xx++)
+          if ((xx + yy) & 1) display.drawPixel(xx, yy, bg);
+    }
   }
 }
 

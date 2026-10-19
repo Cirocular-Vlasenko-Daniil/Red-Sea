@@ -254,13 +254,13 @@ Freezes **all eight** targets at once (P1–P4, AMT, WAV, WTH, ARM) — invertin
 
 ### Freeze Roll
 
-While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `ROLL`, a hit lamp, and the current rate (`1/32`). Below them is a tachometer bar: its length is the speed — each step from 1/4 to 1/128 lengthens it by a sixth — and the needle at its end glides to a new rate. Inside the bar run the note envelopes: each hit comes out of the needle as a tooth and travels left over one beat, so the finer the rate, the denser the teeth; in `GATE` there are gaps between them. The scale `4 8 16 32 64 128` under the bar highlights the current rate.
+While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `Freeze Roll`, a hit lamp, and the current rate (`1/32`). Below them is a tachometer bar: its length is the speed — each step from 1/4 to 1/128 lengthens it by a sixth — and the needle at its end glides to a new rate. Inside the bar run the note envelopes: each hit comes out of the needle as a tooth and travels left over one beat, so the finer the rate, the denser the teeth; in `GATE` there are gaps between them. The scale `4 8 16 32 64 128` under the bar highlights the current rate.
 
 The lamp blinks with each hit as long as a hit lasts longer than two screen frames. Faster than that a real blink would turn into a strobe, so the lamp switches to a dither that changes with every hit, finer as the rate grows: 2×2 blocks, then single-pixel noise, then a checkerboard that inverts every frame. The screen refreshes at 40 frames per second while the window is open.
 
 - The first click starts from what's playing now — the step length (1/16 × SCALE) or the step's retrigger, whichever is faster — and moves it one notch.
 - Hits are timed against the sequencer's grid: after a rate change, the next hit lands on the nearest division of the new grid. 1/64 and 1/128 are exact even though they fall between MIDI clock ticks.
-- The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; `MAX` next to `ROLL` means the rate has hit that limit.
+- The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; rates out of reach are dimmed on the scale.
 - `EMPTY` in the window means nothing is active on the step.
 - The roll stops when you release PLAY, after 2 seconds without turning, or when FREEZE turns off. Nothing is saved — the step's retrigger stays as it was.
 - Like the FREEZE loop itself, the roll plays only while the sequencer is running.
