@@ -209,6 +209,13 @@ const char* retrigNames[5] = {"1/4", "1/8", "1/16", "1/32", "1/64"};
 const uint8_t scaleMultipliers[4] = {1, 2, 4, 8};
 const char* scaleNames[4] = {"1", "1/2", "1/4", "1/8"};
 
+// Шкала Freeze Roll: 1/4 … 1/128. Интервал — в четвертях такта MIDI Clock (24 такта на
+// четверть): у 1/64 и 1/128 он дробный в тактах (1,5 и 0,75), в четвертях — целый.
+constexpr uint8_t ROLL_STEPS = 6;
+const uint16_t rollQ[ROLL_STEPS] = {96, 48, 24, 12, 6, 3};
+const char* rollNames[ROLL_STEPS] = {"1/4", "1/8", "1/16", "1/32", "1/64", "1/128"};
+const char* rollLabels[ROLL_STEPS] = {"4", "8", "16", "32", "64", "128"};
+
 const char* seqDestNames[3] = {"WAV", "AMT", "WTH"};
 
 // Порядок ОТОБРАЖЕНИЯ колонок на шаге секвенсора: NOTE, DST, CC, RTRG
@@ -365,6 +372,9 @@ struct State {
   // если бы режим вообще не включался, а не "перезапускался".
   uint8_t sequencerDisplayStep = 0;
   uint32_t sequencerLastStepTick = 0;
+  // Такт, на котором прозвучал первый шаг после запуска: от него отсчитывается сетка
+  // Freeze Roll, чтобы удары ложились на доли относительно секвенсора.
+  uint32_t seqOriginTick = 0;
   bool sequencerRunning = false;
   // Запуск: первый шаг (шаг 1, плейхед 0) звучит на ближайшем такте, а при запуске двойным
   // TAP под внешний Clock — на ближайшей доле (см. onClockTick).
@@ -394,6 +404,7 @@ struct State {
 
   // MIDI
   volatile uint32_t midiTicks = 0;
+  uint32_t lastTickMicros = 0;  // micros() последнего такта — для позиции внутри такта
   volatile uint32_t beatCounter = 0;
   volatile uint32_t barCounter = 0;
   volatile bool midiRunning = false;
@@ -464,6 +475,17 @@ struct State {
   bool tapPlayLongPressTriggered = false;
   bool tapPlayLongPressFrameVisible = false;
   uint32_t tapPlayLongPressLastBlink = 0;
+
+  // ----- FREEZE ROLL -----
+  // Пока PLAY зажат и включён FREEZE, поворот энкодера запускает ролл: шаг под курсором
+  // повторяется по шкале rollQ вместо обычного повтора с длиной шага. Гаснет через 2 с без
+  // вращения, при отпускании PLAY и при выходе из FREEZE; ничего не сохраняется.
+  bool rollActive = false;
+  uint8_t rollIndex = 2;
+  uint32_t rollLastTurnMs = 0;
+  bool rollUsedThisHold = false;   // за это удержание PLAY крутили ролл — не рандомизировать
+  uint16_t rollQLast = 0;          // интервал, по которому отсчитан rollLastSlot
+  uint32_t rollLastSlot = 0;
 
   // Кнопки
   bool playWasPressed = false;
@@ -738,10 +760,15 @@ uint32_t tickPeriodUs() {
   return internalTickPeriodUs();
 }
 
-// Момент Note Off для GATE: половина интервала до следующего удара (в тактах).
-uint32_t gateOffTime(uint32_t intervalTicks) {
-  if (intervalTicks < 1) intervalTicks = 1;
-  return micros() + intervalTicks * tickPeriodUs() / 2;
+// Интервал в тактах — в мкс (не меньше одного такта).
+uint32_t ticksToUs(uint32_t ticks) {
+  if (ticks < 1) ticks = 1;
+  return ticks * tickPeriodUs();
+}
+
+// Момент Note Off для GATE: половина интервала до следующего удара.
+uint32_t gateOffTime(uint32_t intervalUs) {
+  return micros() + intervalUs / 2;
 }
 
 inline int getRandomAmount() {
@@ -994,7 +1021,7 @@ void processSunReflects() {
         if (state.gateMode && state.sunArpSounding[idx]) {
           // Следующее отражение — через вдвое меньший интервал; нота гаснет на его середине.
           state.sunArpGatePending[idx] = true;
-          state.sunArpOffAt[idx] = gateOffTime(waveIntervals[state.waveIntervalIndex] >> (level + 1));
+          state.sunArpOffAt[idx] = gateOffTime(ticksToUs(waveIntervals[state.waveIntervalIndex] >> (level + 1)));
         }
       }
     }
@@ -1157,8 +1184,9 @@ uint32_t seqHitTicks(uint8_t step) {
 
 // Нота секвенсора уходит на все каналы с Seq Trig. В LEG звучит до следующей ноты (в том
 // числе через пустые шаги): перед новым Note On гасим звучащую — сначала Off, потом On;
-// та же нота перезапускается. В GATE гаснет сама на середине hitTicks (см. processGates).
-void seqNoteOn(uint8_t note, uint32_t hitTicks) {
+// та же нота перезапускается. В GATE гаснет сама на середине hitUs — интервала до
+// следующего удара (см. processGates).
+void seqNoteOn(uint8_t note, uint32_t hitUs) {
   if (state.seqSoundingNote >= 0) sendNoteOffMask(state.seqSoundingMask, (uint8_t)state.seqSoundingNote);
   uint16_t mask = seqChannelMask();
   sendNoteOnMask(mask, note, 100);
@@ -1167,7 +1195,7 @@ void seqNoteOn(uint8_t note, uint32_t hitTicks) {
   state.seqSoundingNote = sent ? note : -1;
   state.seqSoundingMask = sent ? mask : 0;
   state.seqGatePending = sent && state.gateMode;
-  if (state.seqGatePending) state.seqGateOffAt = gateOffTime(hitTicks);
+  if (state.seqGatePending) state.seqGateOffAt = gateOffTime(hitUs);
 }
 
 // Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на всех
@@ -1201,8 +1229,11 @@ void processGates() {
   }
 }
 
-void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
+// hitUs — интервал до следующего удара для GATE; 0 — по шагу и его ретригу (Freeze Roll
+// передаёт свой).
+void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false, uint32_t hitUs = 0) {
   if (stepIndex >= state.sequencerSteps) return;
+  if (hitUs == 0) hitUs = ticksToUs(seqHitTicks(stepIndex));
   uint32_t now = millis();
   for (uint8_t p = 0; p < 4; p++) {
     if (state.steps[stepIndex].active[p]) {
@@ -1210,7 +1241,7 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
       else state.triggerTime[p] = now;
       switch (p) {
         case 0:
-          seqNoteOn(state.steps[stepIndex].note, seqHitTicks(stepIndex));
+          seqNoteOn(state.steps[stepIndex].note, hitUs);
           // Метка тика для проверки строгого совпадения по тику у
           // арпеджиатора RFLCT (см. sunArp / mutateParam).
           state.lastNoteOnTick = state.midiTicks;
@@ -1242,6 +1273,88 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
       }
     }
   }
+}
+
+// ============================================================
+// FREEZE ROLL
+// ============================================================
+// Позиция в четвертях такта от первого шага секвенсора: целые такты плюс доля текущего
+// такта по времени (не больше 3/4 — следующий такт ещё не пришёл).
+uint32_t rollPosQ() {
+  uint32_t period = tickPeriodUs();
+  uint32_t dt = micros() - state.lastTickMicros;
+  uint32_t sub = (dt >= period) ? 3 : dt * 4 / period;
+  return (state.midiTicks - state.seqOriginTick) * 4 + sub;
+}
+
+// Самая частая ступень, которую MIDI-линия успевает отыграть: байты одного удара (Off+On
+// ноты и CC на каждый канал Seq Trig) по 320 мкс, с запасом 25% на CC движка и Clock.
+uint8_t rollMaxIndex() {
+  const SequencerStep& st = state.steps[state.sequencerCursor];
+  uint8_t nCh = __builtin_popcount(seqChannelMask());
+  uint32_t bytes = ((st.active[0] ? 6 : 0) + (st.active[1] ? 3 : 0)) * nCh;
+  if (bytes == 0) return ROLL_STEPS - 1;
+  uint32_t needUs = bytes * 320 * 5 / 4;
+  uint32_t period = tickPeriodUs();
+  for (uint8_t i = ROLL_STEPS - 1; i > 0; i--)
+    if ((uint32_t)rollQ[i] * period / 4 >= needUs) return i;
+  return 0;
+}
+
+// Ступень шкалы для интервала в тактах (длина шага или его ретриг): длиннее четверти —
+// 1/4, ретриг «1/64» (1 такт) — 1/64.
+uint8_t rollIndexForTicks(uint32_t ticks) {
+  if (ticks >= 24) return 0;
+  if (ticks >= 12) return 1;
+  if (ticks >= 6) return 2;
+  if (ticks >= 3) return 3;
+  return 4;
+}
+
+// Ступень, которая реально играет: выбранная, но не чаще, чем успевает MIDI-линия.
+uint8_t rollEffectiveIndex() {
+  uint8_t maxIdx = rollMaxIndex();
+  return (state.rollIndex > maxIdx) ? maxIdx : state.rollIndex;
+}
+
+bool rollStepEmpty() {
+  const SequencerStep& st = state.steps[state.sequencerCursor];
+  return !(st.active[0] || st.active[1] || st.active[2]);
+}
+
+// Поворот энкодера при зажатом PLAY во FREEZE (вправо — чаще). Первый щелчок включает
+// ролл с той частоты, что сейчас звучит (шаг или его ретриг), и сразу сдвигает на ступень.
+void rollTurn(int mov) {
+  if (!state.rollActive) {
+    state.rollActive = true;
+    state.rollIndex = rollIndexForTicks(seqHitTicks(state.sequencerCursor));
+    state.rollQLast = 0;
+  }
+  state.rollIndex = clampU8((int)state.rollIndex + mov, 0, rollMaxIndex());
+  state.rollLastTurnMs = millis();
+  state.rollUsedThisHold = true;
+  state.displayDirty = true;
+}
+
+void stopRoll() {
+  if (!state.rollActive) return;
+  state.rollActive = false;
+  state.displayDirty = true;
+}
+
+// Удары ролла; задача движка зовёт каждые 0,5 мс. Удар — на каждой границе сетки
+// выбранной ступени, отсчитанной от первого шага. При смене ступени отсчёт перестраивается
+// без лишнего удара — следующий ложится на ближайшую долю новой сетки.
+void processRoll() {
+  if (!state.rollActive) return;
+  if (state.bypassMode != BypassMode::FREEZE) { stopRoll(); return; }
+  if (!state.sequencerRunning || state.sequencerStartPending) return;
+  uint16_t q = rollQ[rollEffectiveIndex()];
+  uint32_t slot = rollPosQ() / q;
+  if (q != state.rollQLast) { state.rollQLast = q; state.rollLastSlot = slot; return; }
+  if (slot == state.rollLastSlot) return;
+  state.rollLastSlot = slot;
+  triggerSequencerStep(state.sequencerCursor, true, (uint32_t)q * tickPeriodUs() / 4);
 }
 
 // ============================================================
@@ -1288,6 +1401,7 @@ bool generateInternalTicks() {
 // loop(), когда generateInternalTicks() вернул true.
 void onClockTick() {
   state.midiTicks++;
+  state.lastTickMicros = micros();
   if (state.midiTicks % 24 == 0) {
     state.beatCounter++;
     if (state.beatCounter % 4 == 0) state.barCounter++;
@@ -1314,6 +1428,7 @@ void onClockTick() {
         (!state.sequencerStartOnBeat || state.midiTicks % 24 == 1)) {
       state.sequencerStartPending = false;
       firstStep = true;
+      state.seqOriginTick = state.midiTicks;
     }
     bool tick = firstStep || (!state.sequencerStartPending &&
                               state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
@@ -1344,19 +1459,22 @@ void onClockTick() {
       }
       state.stepFlashActive = true;
       state.stepFlashTime = millis();
-      triggerSequencerStep(newPlayhead, false);
+      // Во время Freeze Roll шаг под курсором играет processRoll() по своей сетке.
+      if (!state.rollActive) triggerSequencerStep(newPlayhead, false);
     }
 
     // Retrigger — тоже относительно отображаемого/триггеримого шага
     // (во FREEZE это шаг под курсором, не молча идущий плейхед).
     uint8_t playhead = state.sequencerDisplayStep;
     uint8_t retrigIdx = state.steps[playhead].retrigIndex;
-    if (retrigIdx > 0 && retrigIdx < 5) {
+    if (state.rollActive) {
+      state.retrigLastTickGlobal = state.midiTicks;  // ретриг шага заменяет ролл
+    } else if (retrigIdx > 0 && retrigIdx < 5) {
       uint32_t interval = retrigIntervals[retrigIdx];
       uint32_t elapsed = state.midiTicks - state.retrigLastTickGlobal;
       for (uint8_t p = 0; p < 4; p++) {
         if (state.retriggerActive[p] && elapsed >= interval) {
-          if (p == 0) { seqNoteOn(state.lastNote, seqHitTicks(playhead)); state.lastNoteOnTick = state.midiTicks; }
+          if (p == 0) { seqNoteOn(state.lastNote, ticksToUs(seqHitTicks(playhead))); state.lastNoteOnTick = state.midiTicks; }
           if (p == 1) sendSeqCC(state.lastCC);
           if (p == 2) {
             uint8_t val = state.lastWavesIndex;
@@ -1582,10 +1700,12 @@ void updateButtons() {
       b.lastStable = b.raw;
       if (prev == LOW && b.lastStable == HIGH) {
         // Отпускание
+        if (i == 0) stopRoll();  // ролл живёт, пока держат PLAY
         if (i == 1) { tapReleaseTime = millis(); tapWasReleased = true; }
         else if (i == 0 && state.playWasPressed) {
           if (buttons[1].lastStable == LOW) {
-            randomizeCurrentPage();
+            // Если за это удержание крутили ролл, отпускание с TAP — не рандомайз.
+            if (!state.rollUsedThisHold) randomizeCurrentPage();
           } else {
             // Вход уже произошёл по нажатию (см. обработку нажатия
             // выше). Здесь — только перфоманс-выход: держишь PLAY
@@ -1673,6 +1793,7 @@ void updateButtons() {
         if (i == 0) {
           state.playWasPressed = true;
           state.playPressTime = millis();
+          state.rollUsedThisHold = false;
           // Перфоманс-функционал: вход в BYPASS/FREEZE происходит
           // сразу по нажатию, а не по отпусканию — чтобы моментально
           // "давить" эффект вживую. Если режим уже включён (залип с
@@ -1858,7 +1979,8 @@ void checkTapPlayLongPress() {
   bool tapPressed = (buttons[1].lastStable == LOW);
   bool playPressed = (buttons[0].lastStable == LOW);
   bool isSequencerMain = (state.currentPage == Page::SEQUENCER && state.subPageSequencer == 0);
-  if (tapPressed && playPressed && isSequencerMain) {
+  // Крутили Freeze Roll за это удержание — это не жест «рандомизировать все шаги».
+  if (tapPressed && playPressed && isSequencerMain && !state.rollUsedThisHold) {
     if (!state.tapPlayLongPressActive) {
       state.tapPlayLongPressActive = true;
       state.tapPlayLongPressStart = millis();
@@ -1896,6 +2018,13 @@ void handleEncoder() {
 
 void handleEncoderDetent(int mov) {
   bool tapPressed = (buttons[1].lastStable == LOW);
+
+  // Пока зажат PLAY, энкодер управляет только Freeze Roll (во FREEZE), а параметры не
+  // трогает — в том числе когда PLAY только что выключил режим или выбран BYPASS.
+  if (buttons[0].lastStable == LOW) {
+    if (state.bypassMode == BypassMode::FREEZE) rollTurn(mov);
+    return;
+  }
 
   // SEQUENCER main
   if (state.currentPage == Page::SEQUENCER && state.subPageSequencer == 0) {
@@ -2892,6 +3021,54 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
   }
 }
 
+// Окно Freeze Roll поверх любой страницы: «ROLL» и текущая частота, под ними шкала из
+// шести ступеней — текущая инвертирована, те, что MIDI-линия сейчас не успевает, приглушены.
+void drawRollOverlay(bool bypass) {
+  uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
+  uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
+  const uint8_t bx = 3, by = 4, bw = Display::W - 6, bh = 25;
+  display.fillRect(bx - 1, by - 1, bw + 2, bh + 2, bg);
+  display.drawRect(bx, by, bw, bh, fg);
+  display.setTextSize(1);
+  display.setTextColor(fg);
+  display.setCursor(bx + 4, by + 3);
+  display.print("ROLL");
+  int16_t x1, y1; uint16_t w, h;
+  if (rollStepEmpty()) {
+    display.getTextBounds("EMPTY", 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(bx + (bw - w) / 2, by + 14);
+    display.print("EMPTY");
+    return;
+  }
+  uint8_t eff = rollEffectiveIndex();
+  uint8_t maxIdx = rollMaxIndex();
+  display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(bx + bw - 4 - w, by + 3);
+  display.print(rollNames[eff]);
+  const uint8_t cw = 19, gap = 1, cy = by + 13, ch = 10;
+  uint8_t cx0 = bx + (bw - (ROLL_STEPS * cw + (ROLL_STEPS - 1) * gap)) / 2;
+  for (uint8_t i = 0; i < ROLL_STEPS; i++) {
+    uint8_t cx = cx0 + i * (cw + gap);
+    bool cur = (i == eff);
+    if (cur) display.fillRect(cx, cy, cw, ch, fg);
+    display.setTextColor(cur ? bg : fg);
+    display.getTextBounds(rollLabels[i], 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(cx + (cw - w) / 2, cy + 1);
+    display.print(rollLabels[i]);
+    if (i > maxIdx) {
+      for (uint8_t yy = cy; yy < cy + ch; yy++)
+        for (uint8_t xx = cx; xx < cx + cw; xx++)
+          if ((xx + yy) & 1) display.drawPixel(xx, yy, bg);
+    }
+  }
+}
+
+// Конец кадра любой страницы: поверх всего — окно Freeze Roll, затем отправка на экран.
+void finishFrame(bool bypass) {
+  if (state.rollActive) drawRollOverlay(bypass);
+  display.flush();
+}
+
 void drawMain(bool bypass) {
   g_fillBackground = false;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
@@ -2935,7 +3112,7 @@ void drawMain(bool bypass) {
       }
     }
   }
-  display.flush();
+  finishFrame(bypass);
 }
 
 // Прямоугольная плашка поверх страницы CC на время ожидания входящего
@@ -3015,7 +3192,7 @@ void drawCC(bool bypass) {
     }
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.flush();
+  finishFrame(bypass);
 }
 
 // Одна снежинка: petals лучей из центра, у каждого луча — короткая
@@ -3100,7 +3277,7 @@ void drawStorm(bool bypass) {
   }
   drawColumnMode(64, wthText, state.selectedParam==2, animTime, bypass, state.frozenWth);
   drawColumnYesNo(96, state.randomizerEnabled, state.selectedParam==3, animTime, amt, bypass, state.frozenArm);
-  display.flush();
+  finishFrame(bypass);
 }
 
 void drawStormSubpage(bool bypass) {
@@ -3312,7 +3489,7 @@ void drawStormSubpage(bool bypass) {
     display.setCursor(10, 16);
     display.print("Coming soon...");
   }
-  display.flush();
+  finishFrame(bypass);
 }
 
 void drawSequencer(bool bypass) {
@@ -3428,7 +3605,7 @@ void drawSequencer(bool bypass) {
     display.getTextBounds(texts[p], 0, 0, &x1, &y1, &w, &h);
     drawTextWithOutline(x + (Display::COL_W-w)/2, my + mh - h - 1, texts[p], textColor, outlineColor);
   }
-  display.flush();
+  finishFrame(bypass);
 }
 
 void drawSequencerSetup(bool bypass) {
@@ -3486,7 +3663,7 @@ void drawSequencerSetup(bool bypass) {
     display.print(values[i]);
   }
   if (state.midiLearnActive) drawMidiLearnBanner(bypass);
-  display.flush();
+  finishFrame(bypass);
 }
 
 // ============================================================
@@ -3736,6 +3913,7 @@ void engineLoop(void*) {
     } else {
       lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
     }
+    processRoll();
     processGates();
     midiPump();
     uint32_t last = lastInternalTickMicros;
@@ -3849,6 +4027,9 @@ void loop() {
   handleEncoder();
   checkTapPageLongPress();
   checkTapPlayLongPress();
+
+  // Freeze Roll: 2 с без вращения — частота возвращается к обычной.
+  if (state.rollActive && millis() - state.rollLastTurnMs >= 2000) stopRoll();
 
   static uint32_t lastAnimTime = 0;
   if (millis() - lastAnimTime >= 50) {
