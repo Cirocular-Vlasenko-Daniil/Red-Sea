@@ -65,7 +65,7 @@ Wiring reference (see `Pins::` in the source for the authoritative list):
 
 ## Status
 
-`main` — first stable release. `beta` — per-parameter MIDI channels, note length, Freeze Roll and the TWST engine; under testing. Issues and pull requests welcome.
+`main` — first stable release. `beta` — per-parameter MIDI channels, note length, Freeze Roll and the TWST engine; under testing. What changed since 1.0: [CHANGELOG.md](CHANGELOG.md). Issues and pull requests welcome.
 
 Updating from the first release: the old global MIDI channel is copied to all four parameters on first boot, so the device behaves as before until you change the routing.
 

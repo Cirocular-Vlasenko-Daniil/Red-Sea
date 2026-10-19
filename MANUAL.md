@@ -78,8 +78,19 @@ Press **PAGE** to cycle: **MAIN → MIDI → STORM → SEQUENCER**. Each page (e
 
 The four live CC values, P1–P4.
 
+![MAIN page](docs/screens/main.png)
+
 - **Page** — a meter per parameter, showing its current value. Turn the encoder to change the selected one directly. **[Hold TAP]** and turn to set the parameter's **CC number** (0–127) instead — while TAP is held, the columns show CC numbers (`CC74`) in place of values.
-- **Subpage** — edit the **min/max range** that parameter is allowed to wander within. Turning the encoder while **[TAP]** is held edits **max**; released, it edits **min**.
+- **Subpage** — edit the **min/max range** that parameter is allowed to wander within. Turning the encoder while **[TAP]** is held edits **max**; released, it edits **min**. The value being edited is underlined.
+
+![MAIN with TAP held](docs/screens/main_tap_cc.png)
+*TAP held: the columns show CC numbers*
+
+![MAIN subpage](docs/screens/main_clamp.png)
+*Subpage: min/max range, min underlined*
+
+![MAIN subpage with TAP held](docs/screens/main_clamp_max.png)
+*With TAP held, max is underlined*
 
 Double-click **[ENC_SW]** to manually freeze the selected parameter (frost animation appears on that column, and it stops responding to any modulation engine until unfrozen).
 
@@ -95,6 +106,12 @@ Routes P1–P4: which MIDI channel each one sends on, and where notes go.
   - **BYP** — which performance mode **[PLAY]** engages: `FRZ` (FREEZE) or `BYP` (BYPASS)
   - **DST** — which target the sequencer's third column (WAV/AMT/WTH) drives
   - **GFX** — background weather animation on/off (pure cosmetics, doesn't touch the engine)
+
+![MIDI page](docs/screens/midi_channels.png)
+*Channels: P1 → 1, P2 → 2, P3 → 10, P4 → NO; the note icon marks Seq Trig*
+
+![MIDI subpage](docs/screens/midi_global.png)
+*Subpage: LEN / BYP / DST / GFX*
 
 Where everything goes:
 
@@ -122,6 +139,9 @@ The heart of the algorithmic engine.
   - **ARM** — master on/off for the algorithmic randomizer. Turn it off to freeze the engine entirely while still editing everything by hand.
 - **Subpage** — the four parameters specific to whichever weather engine is currently selected. See [§7](#7-the-five-weather-engines).
 
+![STORM page](docs/screens/storm.png)
+*STORM with the TWST engine selected*
+
 ---
 
 ## 6. SEQUENCER page
@@ -135,6 +155,12 @@ A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-s
   - **STEPS** — pattern length, 1–16.
   - **CC** — which CC number the sequencer's CC column sends. Triple-click **[ENC_SW]** here to MIDI Learn it.
   - **SCALE** — playback speed multiplier (1, 1/2, 1/4, 1/8).
+
+![SEQUENCER step view](docs/screens/seq_steps.png)
+*Step view: cursor on step 5, playhead on step 7*
+
+![SEQUENCER setup](docs/screens/seq_setup.png)
+*Setup subpage*
 
 **Randomizing:** **[PLAY+TAP]** randomizes just the step under the cursor. Holding **[TAP+PLAY]** together for 3 seconds randomizes every step in the pattern — trigs and activations both — with the screen border blinking as a warning before it fires.
 
@@ -153,6 +179,8 @@ Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STO
 | PHASE | −128…127                 | Phase offset                  |
 | GLIDE | 0…127                    | Smoothing on the LFO's motion |
 
+![FOG subpage](docs/screens/storm_fog.png)
+
 **SHAPE** doesn't just distort — it re-characterizes the wave:
 - On **Sine**, positive SHAPE blends in 2nd/3rd/4th harmonics, making the wave progressively richer; negative SHAPE hard-clips it and blends in noise, turning it into distortion/static.
 - On **Triangle**, SHAPE smoothly skews the peak toward one edge until, at the extreme, it's a clean rising or falling sawtooth.
@@ -169,6 +197,8 @@ Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STO
 | DFLCT | 0–127 | Extra chance to trigger an echo series without hitting the clamp |
 | BIAS | −63…64 | Shifts the random walk up/down |
 
+![SUN subpage](docs/screens/storm_sun.png)
+
 When a parameter's random step would push it past its own min/max, it triggers a series of **echoes** instead of just clamping: up to `RFLCT` repeats, each one landing twice as fast as the last (half the previous interval), shown on-screen as a little stack of receding rectangles.
 
 If **ARP** isn't OFF *and* a sequencer note happened to fire on the exact same clock tick that the echo series was armed, every echo in that cascade also re-triggers that note, transposed further each time: `Same` = no transposition, `5th`/`Oct`/`2Oct` = 7/12/24 semitones **per echo**, cumulative — three echoes at `Oct` land the third one three octaves up. The arpeggio plays on the channel of the echoing parameter, and only if that parameter has Seq Trig on.
@@ -183,6 +213,8 @@ If **ARP** isn't OFF *and* a sequencer note happened to fire on the exact same c
 | WET | 0–127 | Pull-back-to-home strength |
 | SPLSH | 0–127 | Chance to splash a neighboring parameter |
 | THNDR | ON/OFF | Random lightning strikes |
+
+![RAIN subpage](docs/screens/storm_rain.png)
 
 Every RAIN mutation drifts, then gets pulled back toward the parameter's last manually-set value — **WET** is how strong that pull is: 0 is a free random walk (like FOG), 127 barely lets it move at all.
 
@@ -201,6 +233,8 @@ Every RAIN mutation drifts, then gets pulled back toward the parameter's last ma
 | FRZ | 0–127 | Chance to freeze/unfreeze on each hit |
 | TIME | −63…64 | Shapes freeze duration |
 
+![SNOW subpage](docs/screens/storm_snow.png)
+
 SNOW replaces the flat timing grid with a Euclidean rhythm: `FLAKE` steps per cycle, distributed as evenly as possible, at the `WAV` interval per step (shown as a snowflake with one ray per step). **ROTATE** shifts which steps in that cycle land the hits.
 
 On every hit, P1–P4 mutate as usual (scaled by AMT) — and independently, **FRZ** rolls a chance (0–127) for *each* of the eight freezable targets (P1–P4, AMT, WAV, WTH, ARM) to flip: unfrozen → frozen, or frozen → unfrozen if it already was. A short flash on the WEATHER column marks each hit.
@@ -215,6 +249,8 @@ On every hit, P1–P4 mutate as usual (scaled by AMT) — and independently, **F
 | RADS | 0 / OCT / 5+8 / 2OCT / CHR | Pitches the copies can land on |
 | SCAT | 1/8 / 1/4 / 1/2 / 1 / 2 bars | Window the copies fall into |
 | GUST | 0–127 | How hard each impact knocks P1–P4 |
+
+![TWST subpage](docs/screens/storm_twst.png)
 
 TWST listens to the MIDI input — Note On/Off on any channel. Every incoming note plays immediately on the Seq Trig channels ([§4](#4-midi-page)), and `DEBR` copies follow it, each on a random position inside the `SCAT` window (never two on the same position), at a random pitch from `RADS`, with the same velocity. Releasing the key ends the original note; copies already in the air keep falling. The DEBR column shows the impact point with one dot per copy.
 
@@ -252,11 +288,22 @@ Mutes **all** outgoing MIDI — nothing leaves the device. The algorithmic engin
 
 Freezes **all eight** targets at once (P1–P4, AMT, WAV, WTH, ARM) — inverting whatever was already frozen, so anything you'd frozen by hand stays consistent when you exit. While active, the sequencer stops advancing and instead **loops the step under the cursor**, at the tempo set by `SCALE`. The whole screen inverts and shows a "FROZEN" banner (except on the SEQUENCER page, where the normal header stays visible so you can watch the loop).
 
+![FREEZE engaged](docs/screens/frozen.png)
+
 ### Freeze Roll
 
 While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `Freeze Roll`, a hit lamp, and the current rate (`1/32`). Below them is a tachometer bar: its length is the speed — each step from 1/4 to 1/128 lengthens it by a sixth — and the needle at its end glides to a new rate. Inside the bar run the note envelopes: each hit comes out of the needle as a tooth and travels left over one beat, so the finer the rate, the denser the teeth; in `GATE` there are gaps between them. The scale `4 8 16 32 64 128` under the bar highlights the current rate.
 
 The lamp blinks with each hit as long as a hit lasts longer than two screen frames. Faster than that a real blink would turn into a strobe, so the lamp switches to a dither that changes with every hit, finer as the rate grows: 2×2 blocks, then single-pixel noise, then a checkerboard that inverts every frame. The screen refreshes at 40 frames per second while the window is open.
+
+![Freeze Roll at 1/16](docs/screens/roll_16.png)
+*1/16: the needle, the scale and the teeth of each hit*
+
+![Freeze Roll at 1/64 in GATE](docs/screens/roll_64_gate.png)
+*1/64 with LEN = GATE: short teeth with gaps, the lamp dithers*
+
+![Freeze Roll at the MIDI limit](docs/screens/roll_limit.png)
+*300 BPM, four Seq Trig channels: 1/64 and 1/128 are out of reach and dimmed*
 
 - The first click starts from what's playing now — the step length (1/16 × SCALE) or the step's retrigger, whichever is faster — and moves it one notch.
 - Hits are timed against the sequencer's grid: after a rate change, the next hit lands on the nearest division of the new grid. 1/64 and 1/128 are exact even though they fall between MIDI clock ticks.
@@ -284,6 +331,8 @@ Instead of dialing in a CC number and channel by hand, grab them straight from y
 - the SEQUENCER setup subpage, with the CC column selected — learns the sequencer's CC number (only the number: the sequencer CC goes to the Seq Trig channels).
 
 A banner reading *"Waiting for midi data"* appears. Move a control on whatever's connected to the MIDI input — the next Control Change message received (on any channel) is captured, assigned, and the banner disappears. Any button press cancels the wait without assigning anything, and leaving the page does the same automatically.
+
+![MIDI Learn waiting](docs/screens/midi_learn.png)
 
 ---
 
