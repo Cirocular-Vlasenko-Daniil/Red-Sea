@@ -194,7 +194,9 @@ Preferences storage;
 // ============================================================
 // 2. ТИПЫ И КОНСТАНТЫ
 // ============================================================
-enum class WeatherMode : uint8_t { FOG, SUN, RAIN, SNOW };
+enum class WeatherMode : uint8_t { FOG, SUN, RAIN, SNOW, TWST };
+constexpr uint8_t NUM_WEATHERS = 5;
+const char* weatherNames[NUM_WEATHERS] = {"FOG", "SUN", "RAIN", "SNOW", "TWST"};
 enum class Page : uint8_t { MAIN, CC, STORM, SEQUENCER };
 enum class BypassMode : uint8_t { OFF, BYPASS, FREEZE };
 enum class SeqDest : uint8_t { WAV, AMT, WTH };
@@ -215,6 +217,18 @@ constexpr uint8_t ROLL_STEPS = 6;
 const uint16_t rollQ[ROLL_STEPS] = {96, 48, 24, 12, 6, 3};
 const char* rollNames[ROLL_STEPS] = {"1/4", "1/8", "1/16", "1/32", "1/64", "1/128"};
 const char* rollLabels[ROLL_STEPS] = {"4", "8", "16", "32", "64", "128"};
+
+// TWST. SCAT — окно, в которое падают осколки: всегда 16 позиций (у 1/8 — 8), но не
+// мельче 1/64. Позиция — в четвертях такта, как у ролла.
+constexpr uint8_t TWST_SCATS = 5;
+const uint8_t twstSlotQ[TWST_SCATS] = {6, 6, 12, 24, 48};
+const uint8_t twstSlots[TWST_SCATS] = {8, 16, 16, 16, 16};
+const char* twstScatNames[TWST_SCATS] = {"1/8", "1/4", "1/2", "1", "2"};
+// RADS — куда по высоте разлетаются осколки: та же нота, ±октава, квинты и октавы,
+// ±2 октавы, любой полутон в пределах октавы.
+constexpr uint8_t TWST_RADS = 5;
+const char* twstRadsNames[TWST_RADS] = {"0", "OCT", "5+8", "2OCT", "CHR"};
+constexpr uint8_t TWST_MAX_DEBR = 8;
 
 const char* seqDestNames[3] = {"WAV", "AMT", "WTH"};
 
@@ -346,6 +360,25 @@ struct State {
   // 4=AMT, 5=WAV, 6=WTH, 7=ARM.
   bool snowFreezeActive[8] = {false};
   uint32_t snowFreezeUntilTick[8] = {0};
+
+  // ----- ПАРАМЕТРЫ ДЛЯ TWST -----
+  // Каждая входящая нота звучит сразу и разлетается облаком копий (осколков): DEBR штук,
+  // в случайные позиции окна SCAT, на случайную высоту из набора RADS. Каждый удар
+  // (сама нота и осколки) задевает по кругу один из P1–P4: тот отскакивает от базы на
+  // величину до GUST × AMT и за время WAV возвращается обратно.
+  uint8_t twstDebr = 0;   // 0..8
+  uint8_t twstRads = 0;   // 0..4, см. twstRadsNames
+  uint8_t twstScat = 0;   // 0..4, см. twstScatNames
+  uint8_t twstGust = 0;   // 0..127
+  uint8_t twstGustNext = 0;                    // следующий P по кругу
+  bool twstGustActive[NUM_PARAMS] = {false};   // P возвращается к базе
+  uint8_t twstGustFrom[NUM_PARAMS] = {0};      // куда отскочил
+  uint32_t twstGustAt[NUM_PARAMS] = {0};       // когда (micros)
+  uint32_t twstRng = 0x2545F491;               // свой генератор: во FREEZE узор повторяется
+  bool twstFrozenSeedValid = false;
+  uint32_t twstFrozenSeed = 0;
+  uint32_t twstHitTime = 0;                    // millis() последнего удара — для анимации
+  bool twstWasOn = false;
 
   // LFO (для FOG)
   uint8_t lfoType = 0;
@@ -926,6 +959,8 @@ void mutateParam(uint8_t idx) {
       state.params[idx].value = (uint8_t)newVal;
       sendParamCC(idx);
       break;
+    case WeatherMode::TWST:
+      break;  // P1–P4 двигают только удары входящих нот (twstGustImpact)
   }
 }
 
@@ -1213,11 +1248,13 @@ void sendSeqCC(uint8_t val) {
   sendCCMask(seqChannelMask(), state.sequencerCC, val);
 }
 
-// Погасить всё, что звучит: ноту секвенсора и ноты арпеджио RFLCT (перед тем как выход
-// заглушит BYPASS — иначе ноты повиснут).
+// Погасить всё, что звучит: ноту секвенсора, ноты арпеджио RFLCT и TWST (перед тем как
+// выход заглушит BYPASS — иначе ноты повиснут).
+void twstReleaseAll();
 void releaseSoundingNotes() {
   seqNotesOff(false);
   for (uint8_t i = 0; i < NUM_PARAMS; i++) stopSunArp(i);
+  twstReleaseAll();
 }
 
 // GATE: гасит ноты, у которых подошёл момент Note Off. Задача движка зовёт её каждые 0,5 мс.
@@ -1260,7 +1297,7 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false, uint32_t hi
               break;
             case SeqDest::WTH: {
               if (!state.frozenWth) {
-                uint8_t mode = constrain(val, 0, 3);
+                uint8_t mode = constrain(val, 0, NUM_WEATHERS - 1);
                 state.weatherMode = (WeatherMode)mode;
               }
               break;
@@ -1355,6 +1392,194 @@ void processRoll() {
   if (slot == state.rollLastSlot) return;
   state.rollLastSlot = slot;
   triggerSequencerStep(state.sequencerCursor, true, (uint32_t)q * tickPeriodUs() / 4);
+}
+
+// ============================================================
+// TWST — входящие ноты разлетаются осколками
+// ============================================================
+// Всё по времени (micros), а не по тактам: осколки бывают по 1/64 (1,5 такта), и режим
+// работает при остановленном секвенсоре — темп тогда берётся из внутреннего BPM.
+namespace Twst {
+  constexpr uint8_t VOICES = 16;   // звучащие и запланированные осколки вместе
+  struct Voice {
+    bool used, sounding;
+    uint8_t note, vel;
+    uint16_t mask;                 // каналы Note On
+    uint32_t onAt, offAt;
+  };
+  Voice voices[VOICES];
+  uint16_t dryMask[128];           // входная нота -> каналы, где звучит сам удар
+}
+
+uint32_t twstNext() {
+  uint32_t x = state.twstRng;
+  x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+  return state.twstRng = x;
+}
+int twstRand(int lo, int hiExcl) {
+  return lo + (int)(twstNext() % (uint32_t)(hiExcl - lo));
+}
+
+// Интервал осколка по набору RADS.
+int twstInterval() {
+  static const int8_t oct[] = {-12, 12};
+  static const int8_t fifthOct[] = {-12, -7, 7, 12};
+  static const int8_t twoOct[] = {-24, -12, 12, 24};
+  switch (state.twstRads) {
+    case 1: return oct[twstRand(0, 2)];
+    case 2: return fifthOct[twstRand(0, 4)];
+    case 3: return twoOct[twstRand(0, 4)];
+    case 4: return twstRand(-12, 13);
+    default: return 0;
+  }
+}
+
+// Одна нота на канале звучит одним экземпляром: перед новым Note On гасим ту же ноту на
+// тех же каналах — у сыгранной клавиши и у звучащих осколков.
+void twstFreeNote(uint8_t note, uint16_t mask) {
+  uint16_t d = Twst::dryMask[note] & mask;
+  if (d) { sendNoteOffMask(d, note); Twst::dryMask[note] &= ~d; }
+  for (uint8_t i = 0; i < Twst::VOICES; i++) {
+    Twst::Voice& v = Twst::voices[i];
+    if (!v.used || !v.sounding || v.note != note || !(v.mask & mask)) continue;
+    uint16_t o = v.mask & mask;
+    sendNoteOffMask(o, note);
+    v.mask &= ~o;
+    if (!v.mask) v.used = false;
+  }
+}
+
+void twstReleaseAll() {
+  for (uint8_t i = 0; i < Twst::VOICES; i++) {
+    Twst::Voice& v = Twst::voices[i];
+    if (v.used && v.sounding) sendNoteOffMask(v.mask, v.note);
+    v.used = false;
+  }
+  for (uint8_t n = 0; n < 128; n++) {
+    if (Twst::dryMask[n]) { sendNoteOffMask(Twst::dryMask[n], n); Twst::dryMask[n] = 0; }
+  }
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) state.twstGustActive[i] = false;
+}
+
+// Удар задевает следующий по кругу незамороженный P: тот отскакивает от базы на
+// величину от половины до полной GUST × AMT, вверх или вниз (куда есть место в CLAMP).
+void twstGustImpact() {
+  state.twstHitTime = millis();
+  int maxJump = (int)state.twstGust * state.chaos / 100;
+  if (maxJump < 1) return;
+  uint8_t idx = NUM_PARAMS;
+  for (uint8_t n = 0; n < NUM_PARAMS; n++) {
+    uint8_t i = state.twstGustNext;
+    state.twstGustNext = (i + 1) % NUM_PARAMS;
+    if (!state.frozen[i]) { idx = i; break; }
+  }
+  if (idx == NUM_PARAMS) return;
+  Param& p = state.params[idx];
+  int jump = twstRand(maxJump / 2, maxJump + 1);
+  if (twstRand(0, 2)) jump = -jump;
+  int v = (int)p.baseValue + jump;
+  if (v > p.max || v < p.min) v = (int)p.baseValue - jump;
+  p.value = clampU8(v, p.min, p.max);
+  sendParamCC(idx);
+  state.twstGustFrom[idx] = p.value;
+  state.twstGustAt[idx] = micros();
+  state.twstGustActive[idx] = true;
+}
+
+// Входящий Note On (любой канал). Сам удар звучит сразу на каналах с Seq Trig, следом
+// планируются осколки. ARM выключен — только сам удар, без осколков и GUST.
+void twstNoteOn(uint8_t note, uint8_t vel) {
+  if (state.weatherMode != WeatherMode::TWST) return;
+  uint16_t mask = seqChannelMask();
+  if (!mask) return;
+  // FREEZE: каждый удар разлетается по одному и тому же узору.
+  if (state.bypassMode == BypassMode::FREEZE) {
+    if (!state.twstFrozenSeedValid) { state.twstFrozenSeed = state.twstRng; state.twstFrozenSeedValid = true; }
+    state.twstRng = state.twstFrozenSeed;
+  } else {
+    state.twstFrozenSeedValid = false;
+  }
+  twstFreeNote(note, mask);
+  sendNoteOnMask(mask, note, vel);
+  if (state.bypassMode != BypassMode::BYPASS) Twst::dryMask[note] = mask;
+  if (!state.randomizerEnabled) return;
+  twstGustImpact();
+
+  // Осколки — в случайные неповторяющиеся позиции окна (позиция 0 — сам удар).
+  uint8_t slots = twstSlots[state.twstScat];
+  uint32_t slotUs = (uint32_t)twstSlotQ[state.twstScat] * tickPeriodUs() / 4;
+  uint32_t lenUs = state.gateMode ? slotUs / 2 : slotUs;  // LEG — до следующей позиции
+  uint8_t pos[16];
+  for (uint8_t i = 0; i < slots; i++) pos[i] = i + 1;
+  uint8_t count = (state.twstDebr < slots) ? state.twstDebr : slots;
+  uint32_t now = micros();
+  uint8_t v = 0;
+  for (uint8_t k = 0; k < count; k++) {
+    uint8_t j = k + twstRand(0, slots - k);
+    uint8_t t = pos[k]; pos[k] = pos[j]; pos[j] = t;
+    int n = clampInt((int)note + twstInterval(), 0, 127);
+    while (v < Twst::VOICES && Twst::voices[v].used) v++;
+    if (v >= Twst::VOICES) continue;  // все голоса заняты — осколок теряется
+    Twst::Voice& voice = Twst::voices[v];
+    voice.used = true;
+    voice.sounding = false;
+    voice.note = (uint8_t)n;
+    voice.vel = vel;
+    voice.mask = mask;
+    voice.onAt = now + pos[k] * slotUs;
+    voice.offAt = voice.onAt + lenUs;
+  }
+}
+
+void twstNoteOff(uint8_t note) {
+  if (!Twst::dryMask[note]) return;
+  sendNoteOffMask(Twst::dryMask[note], note);
+  Twst::dryMask[note] = 0;
+}
+
+// Задача движка зовёт каждые 0,5 мс: Note Off и Note On осколков, возврат P к базе.
+void processTwst() {
+  if (state.weatherMode != WeatherMode::TWST) {
+    // Ушли с TWST — гасим всё, что звучит и запланировано.
+    if (state.twstWasOn) { twstReleaseAll(); state.twstWasOn = false; }
+    return;
+  }
+  state.twstWasOn = true;
+  uint32_t now = micros();
+  for (uint8_t i = 0; i < Twst::VOICES; i++) {
+    Twst::Voice& v = Twst::voices[i];
+    if (v.used && v.sounding && (int32_t)(now - v.offAt) >= 0) {
+      sendNoteOffMask(v.mask, v.note);
+      v.used = false;
+    }
+  }
+  for (uint8_t i = 0; i < Twst::VOICES; i++) {
+    Twst::Voice& v = Twst::voices[i];
+    if (!v.used || v.sounding || (int32_t)(now - v.onAt) < 0) continue;
+    if (state.bypassMode == BypassMode::BYPASS) { v.used = false; continue; }
+    twstFreeNote(v.note, v.mask);
+    sendNoteOnMask(v.mask, v.note, v.vel);
+    v.sounding = true;
+    twstGustImpact();
+  }
+  // Возврат задетых P к базе — линейно за время WAV.
+  uint32_t durUs = ticksToUs(waveIntervals[state.waveIntervalIndex]);
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+    if (!state.twstGustActive[i]) continue;
+    if (state.frozen[i]) { state.twstGustActive[i] = false; continue; }
+    Param& p = state.params[i];
+    uint32_t el = now - state.twstGustAt[i];
+    int target = p.baseValue;
+    int val;
+    if (el >= durUs) {
+      val = target;
+      state.twstGustActive[i] = false;
+    } else {
+      val = target + (int)((int32_t)(state.twstGustFrom[i] - target) * (int32_t)(durUs - el) / (int32_t)durUs);
+    }
+    val = clampU8(val, p.min, p.max);
+    if (val != p.value) { p.value = val; sendParamCC(i); }
+  }
 }
 
 // ============================================================
@@ -1481,7 +1706,7 @@ void onClockTick() {
             switch (state.seqDest) {
               case SeqDest::WAV: if (!state.frozenWav) state.waveIntervalIndex = constrain(val, 0, 4); break;
               case SeqDest::AMT: if (!state.frozenAmt) state.chaos = constrain(map(val, 0, 127, 0, 100), 0, 100); break;
-              case SeqDest::WTH: if (!state.frozenWth) state.weatherMode = (WeatherMode)constrain(val, 0, 3); break;
+              case SeqDest::WTH: if (!state.frozenWth) state.weatherMode = (WeatherMode)constrain(val, 0, NUM_WEATHERS - 1); break;
             }
           }
           state.retrigLastTickGlobal = state.midiTicks;
@@ -1505,9 +1730,11 @@ void onClockTick() {
       // RAIN: у каждого параметра свой, расстроенный от клока по
       // DRIP тайминг капель (см. processRainDrops), плюс THNDR.
       processRainDrops(interval);
-    } else if (state.weatherMode != WeatherMode::FOG && state.midiTicks % interval == 0) {
+    } else if (state.weatherMode != WeatherMode::FOG && state.weatherMode != WeatherMode::TWST &&
+               state.midiTicks % interval == 0) {
       // FOG сюда не входит: его параметры ведёт LFO ниже, и случайный сдвиг на том же
-      // такте давал лишний CC прямо перед значением LFO.
+      // такте давал лишний CC прямо перед значением LFO. TWST двигает P только от входящих
+      // нот (processTwst).
       for (uint8_t i = 0; i < NUM_PARAMS; i++) mutateParam(i);
     }
   }
@@ -1573,7 +1800,7 @@ void processExternalClockTick() {
 }
 
 // ----- Минимальный парсер входящих канальных сообщений -----
-// Нужен только для MIDI Learn (детектирования входящих Control Change).
+// Control Change — для MIDI Learn, Note On/Off — для TWST.
 // Состояние running status переживает между вызовами processMIDI(),
 // т.к. байты одного сообщения могут прийти по кускам в разных
 // проходах loop().
@@ -1675,8 +1902,14 @@ void processMIDI() {
       midiParsePendingByte = data;
       midiParseHaveFirstData = true;
     } else {
-      if ((midiRunningStatus & 0xF0) == 0xB0) {
-        handleIncomingCC((midiRunningStatus & 0x0F) + 1, midiParsePendingByte & 0x7F, data & 0x7F);
+      uint8_t type = midiRunningStatus & 0xF0;
+      uint8_t d1 = midiParsePendingByte & 0x7F, d2 = data & 0x7F;
+      if (type == 0xB0) {
+        handleIncomingCC((midiRunningStatus & 0x0F) + 1, d1, d2);
+      } else if (type == 0x90 && d2 > 0) {
+        twstNoteOn(d1, d2);
+      } else if (type == 0x80 || type == 0x90) {   // Note On с velocity 0 — тоже Note Off
+        twstNoteOff(d1);
       }
       midiParseHaveFirstData = false;
     }
@@ -2039,7 +2272,7 @@ void handleEncoderDetent(int mov) {
         switch (state.seqDest) {
           case SeqDest::WAV: v = clampU8(v, 0, 4); break;
           case SeqDest::AMT: v = clampU8(v, 0, 127); break;
-          case SeqDest::WTH: v = clampU8(v, 0, 3); break;
+          case SeqDest::WTH: v = clampU8(v, 0, NUM_WEATHERS - 1); break;
         }
         state.steps[state.sequencerCursor].wavesIndex = (uint8_t)v;
         break;
@@ -2107,6 +2340,14 @@ void handleEncoderDetent(int mov) {
         case 1: { int v = (int)state.rainWet + mov; state.rainWet = clampU8(v, 0, 127); break; }
         case 2: { int v = (int)state.rainSplsh + mov; state.rainSplsh = clampU8(v, 0, 127); break; }
         case 3: { if (mov != 0) state.rainThunder = !state.rainThunder; break; }
+      }
+    } else if (state.weatherMode == WeatherMode::TWST) {
+      // Параметры TWST; крупный шаг с TAP — только у GUST
+      switch (state.selectedParam) {
+        case 0: { int v = (int)state.twstDebr + mov; state.twstDebr = clampU8(v, 0, TWST_MAX_DEBR); break; }
+        case 1: { int v = (int)state.twstRads + mov; state.twstRads = clampU8(v, 0, TWST_RADS - 1); break; }
+        case 2: { int v = (int)state.twstScat + mov; state.twstScat = clampU8(v, 0, TWST_SCATS - 1); break; }
+        case 3: { int v = (int)state.twstGust + mov * (tapPressed ? 4 : 1); state.twstGust = clampU8(v, 0, 127); break; }
       }
     } else {
       return;
@@ -2220,7 +2461,7 @@ void handleEncoderDetent(int mov) {
       switch (state.selectedParam) {
         case 0: { int v = state.chaos + mov * 2; state.chaos = clampU8(v, 0, 100); break; }
         case 1: { int idx = (int)state.waveIntervalIndex + mov; state.waveIntervalIndex = clampU8(idx, 0, 4); break; }
-        case 2: { int m = (int)state.weatherMode + mov; if (m < 0) m = 0; if (m > 3) m = 3; state.weatherMode = (WeatherMode)m; break; }
+        case 2: { int m = (int)state.weatherMode + mov; if (m < 0) m = 0; if (m > NUM_WEATHERS - 1) m = NUM_WEATHERS - 1; state.weatherMode = (WeatherMode)m; break; }
         case 3: { if (mov != 0) state.randomizerEnabled = !state.randomizerEnabled; break; }
       }
       state.needSaveStorm = true;
@@ -2286,12 +2527,17 @@ void randomizeCurrentPage() {
           state.rainWet = random(0, 128);
           state.rainSplsh = random(0, 128);
           state.rainThunder = random(0, 2);
+        } else if (state.weatherMode == WeatherMode::TWST) {
+          state.twstDebr = random(0, TWST_MAX_DEBR + 1);
+          state.twstRads = random(0, TWST_RADS);
+          state.twstScat = random(0, TWST_SCATS);
+          state.twstGust = random(0, 128);
         }
         state.needSaveStorm = true;
       } else {
         if (!state.frozenAmt) state.chaos = random(0, 101);
         if (!state.frozenWav) state.waveIntervalIndex = random(0, 5);
-        if (!state.frozenWth) state.weatherMode = (WeatherMode)random(0, 4);
+        if (!state.frozenWth) state.weatherMode = (WeatherMode)random(0, NUM_WEATHERS);
         state.needSaveStorm = true;
       }
       state.displayDirty = true;
@@ -2306,7 +2552,7 @@ void randomizeCurrentPage() {
         switch (state.seqDest) {
           case SeqDest::WAV: state.steps[i].wavesIndex = random(0, 5); break;
           case SeqDest::AMT: state.steps[i].wavesIndex = random(0, 128); break;
-          case SeqDest::WTH: state.steps[i].wavesIndex = random(0, 4); break;
+          case SeqDest::WTH: state.steps[i].wavesIndex = random(0, NUM_WEATHERS); break;
         }
         state.steps[i].retrigIndex = random(0, 5);
       } else {
@@ -2333,7 +2579,7 @@ void randomizeSequencerAll() {
     switch (state.seqDest) {
       case SeqDest::WAV: state.steps[step].wavesIndex = random(0, 5); break;
       case SeqDest::AMT: state.steps[step].wavesIndex = random(0, 128); break;
-      case SeqDest::WTH: state.steps[step].wavesIndex = random(0, 4); break;
+      case SeqDest::WTH: state.steps[step].wavesIndex = random(0, NUM_WEATHERS); break;
     }
     state.steps[step].retrigIndex = random(0, 5);
   }
@@ -2440,6 +2686,12 @@ void resetToDefaults() {
           state.rainThunder = false;
           for (uint8_t i = 0; i < NUM_PARAMS; i++) state.rainNextTick[i] = 0;
           state.rainStrikeActive = false;
+        } else if (state.weatherMode == WeatherMode::TWST) {
+          state.twstDebr = 0;
+          state.twstRads = 0;
+          state.twstScat = 0;
+          state.twstGust = 0;
+          for (uint8_t i = 0; i < NUM_PARAMS; i++) state.twstGustActive[i] = false;
         }
         state.needSaveStorm = true;
       }
@@ -2754,6 +3006,38 @@ void drawSnow(uint32_t time, uint8_t amt, bool bypass=false) {
   }
 }
 
+// TWST: воронка — узкая внизу, широкая вверху, крутится (быстрее с AMT) и медленно гуляет
+// по экрану; задняя сторона прорежена дизерингом. После каждого удара на входе от неё
+// ~0,4 с разлетаются обломки.
+void drawTwister(uint32_t time, uint8_t amt, bool bypass=false) {
+  if (!state.gfxEnabled) return;
+  uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
+  float t = time / 1000.0f;
+  int16_t cx = 100 + (int16_t)(animSin(t * 0.3f) * 10.0f);
+  float spin = t * (3.0f + amt / 25.0f);
+  for (uint8_t y = 0; y < 17; y++) {
+    float r = 1.0f + (16 - y) * 0.55f;
+    int16_t bend = (int16_t)(animSin(t * 0.8f + y * 0.15f) * (16 - y) * 0.15f);
+    for (uint8_t k = 0; k < 3; k++) {
+      float a = spin + y * 0.45f + k * 2.094f;
+      int16_t px = cx + bend + (int16_t)(animCos(a) * r);
+      if (px < 0 || px >= Display::W) continue;
+      bool front = animSin(a) > 0;
+      if (front || bayer[y & 7][px & 7] < 24) display.drawPixel(px, y, color);
+    }
+  }
+  uint32_t since = millis() - state.twstHitTime;
+  if (state.twstHitTime && since < 400) {
+    int16_t d = 3 + since / 25;
+    for (uint8_t i = 0; i < 6; i++) {
+      float a = i * 1.047f + (state.twstHitTime % 7);
+      int16_t px = cx + (int16_t)(animCos(a) * d * 1.6f);
+      int16_t py = 8 + (int16_t)(animSin(a) * d * 0.5f);
+      if (px >= 0 && px < Display::W && py >= 0 && py < 17) display.drawPixel(px, py, color);
+    }
+  }
+}
+
 void drawWeather(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   switch (state.weatherMode) {
@@ -2761,6 +3045,7 @@ void drawWeather(uint32_t time, uint8_t amt, bool bypass=false) {
     case WeatherMode::SUN:  drawSun(time, amt, bypass); break;
     case WeatherMode::RAIN: drawRain(time, amt, bypass); break;
     case WeatherMode::SNOW: drawSnow(time, amt, bypass); break;
+    case WeatherMode::TWST: drawTwister(time, amt, bypass); break;
   }
 }
 
@@ -2976,10 +3261,12 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
     static const char* sunSubParams[4]  = {"RFLCT","ARP","DFLCT","BIAS"};
     static const char* snowSubParams[4] = {"FLAKE","ROTATE","FRZ","TIME"};
     static const char* rainSubParams[4] = {"DRIP","WET","SPLSH","THNDR"};
+    static const char* twstSubParams[4] = {"DEBRIS","RADIUS","SCATTER","GUST"};
     switch (state.weatherMode) {
       case WeatherMode::SUN:  param = sunSubParams[sel]; break;
       case WeatherMode::SNOW: param = snowSubParams[sel]; break;
       case WeatherMode::RAIN: param = rainSubParams[sel]; break;
+      case WeatherMode::TWST: param = twstSubParams[sel]; break;
       default:                param = fogSubParams[sel]; break;
     }
   } else if (page == Page::CC && state.subPageCC == 1) {
@@ -3231,6 +3518,17 @@ void drawEchoRectSprite(int16_t cx, int16_t cy, uint8_t count, uint16_t color) {
   display.fillRect(originX, originY, rw, rh, color);
 }
 
+// Пиктограмма DEBR: точка удара в центре и count осколков (0..8) вокруг неё, на разном
+// расстоянии — как разлетевшиеся обломки.
+void drawDebrisSprite(int16_t cx, int16_t cy, uint8_t count, uint16_t color) {
+  static const int8_t pts[TWST_MAX_DEBR][2] = {
+    {-5, -2}, {5, 1}, {-2, 3}, {3, -3}, {-7, 2}, {8, -2}, {1, 4}, {-4, -4}
+  };
+  display.fillRect(cx - 1, cy - 1, 2, 2, color);
+  for (uint8_t i = 0; i < count && i < TWST_MAX_DEBR; i++)
+    display.drawPixel(cx + pts[i][0], cy + pts[i][1], color);
+}
+
 // Пиктограмма DRIP: круги на воде. Точка падения капли в центре,
 // плюс кольца — число колец растёт вместе со значением (0..127).
 void drawRippleSprite(int16_t cx, int16_t cy, uint8_t value, uint16_t color) {
@@ -3256,14 +3554,7 @@ void drawStorm(bool bypass) {
   uint32_t currentPos = state.midiTicks % interval;
   uint8_t wavFill = map(currentPos, 0, interval, 0, 127);
   drawColumnText(32, wavFill, waveIntervalNames[state.waveIntervalIndex], state.selectedParam==1, animTime, amt, bypass, state.frozenWav);
-  const char* wthText;
-  switch (state.weatherMode) {
-    case WeatherMode::FOG: wthText="FOG"; break;
-    case WeatherMode::SUN: wthText="SUN"; break;
-    case WeatherMode::RAIN: wthText="RAIN"; break;
-    case WeatherMode::SNOW: wthText="SNOW"; break;
-    default: wthText="---";
-  }
+  const char* wthText = ((uint8_t)state.weatherMode < NUM_WEATHERS) ? weatherNames[(uint8_t)state.weatherMode] : "---";
   // Индикация пульсации евклидового секвенсора SNOW — вспышка
   // снежинки за баром WEATHER. drawColumnMode ничего не заливает под
   // собой (в отличие от других колонок), так что вспышка остаётся
@@ -3483,6 +3774,44 @@ void drawStormSubpage(bool bypass) {
       }
       if (state.selectedParam == i) drawCornerCursor(x, my, Display::COL_W, mh, fg);
     }
+  } else if (state.weatherMode == WeatherMode::TWST) {
+    const char* labels[4] = {"DEBR", "RADS", "SCAT", "GUST"};
+    char values[4][8];
+    sprintf(values[1], "%s", twstRadsNames[state.twstRads]);
+    sprintf(values[2], "%s", twstScatNames[state.twstScat]);
+    sprintf(values[3], "%d", state.twstGust);
+
+    const uint8_t my = Display::METER_Y;
+    const uint8_t mh = Display::METER_H;
+    for (uint8_t i = 0; i < 4; i++) {
+      uint8_t x = i * 32;
+      uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
+      uint16_t bg2 = bypass ? SSD1306_WHITE : SSD1306_BLACK;
+      if (state.selectedParam == i) {
+        display.fillRect(x, my, Display::COL_W, mh, fg);
+        display.setTextColor(bg2);
+      } else {
+        display.fillRect(x, my, Display::COL_W, mh, bg2);
+        display.setTextColor(fg);
+      }
+      display.setTextSize(1);
+      int16_t x1, y1; uint16_t w, h;
+      display.getTextBounds(labels[i], 0, 0, &x1, &y1, &w, &h);
+      display.setCursor(x + (Display::COL_W - w) / 2, my + 1);
+      display.print(labels[i]);
+      if (i == 0) {
+        // DEBR: вместо числа — точка удара и столько осколков вокруг, сколько их летит.
+        uint16_t iconColor = (state.selectedParam == i) ? bg2 : fg;
+        int16_t cx = x + Display::COL_W / 2;
+        int16_t cy = my + 1 + h + 1 + (mh - (h + 2)) / 2;
+        drawDebrisSprite(cx, cy, state.twstDebr, iconColor);
+      } else {
+        display.getTextBounds(values[i], 0, 0, &x1, &y1, &w, &h);
+        display.setCursor(x + (Display::COL_W - w) / 2, my + mh - h - 1);
+        display.print(values[i]);
+      }
+      if (state.selectedParam == i) drawCornerCursor(x, my, Display::COL_W, mh, fg);
+    }
   } else {
     display.setTextSize(1);
     display.setTextColor(bypass ? SSD1306_BLACK : SSD1306_WHITE);
@@ -3548,9 +3877,8 @@ void drawSequencer(bool bypass) {
       break;
     }
     case SeqDest::WTH: {
-      uint8_t w = constrain(destVal, 0, 3);
-      const char* wNames[4] = {"FOG", "SUN", "RAIN", "SNOW"};
-      strcpy(destText, wNames[w]);
+      uint8_t w = constrain(destVal, 0, NUM_WEATHERS - 1);
+      strcpy(destText, weatherNames[w]);
       break;
     }
   }
@@ -3813,7 +4141,7 @@ void loadSettings() {
   state.waveIntervalIndex = storage.getUChar("waveIdx", 2);
   if (state.waveIntervalIndex > 4) state.waveIntervalIndex = 2;
   uint8_t weather = storage.getUChar("weather", 0);
-  if (weather > 3) weather = 0;
+  if (weather >= NUM_WEATHERS) weather = 0;
   state.weatherMode = (WeatherMode)weather;
   // LFO
   state.lfoType = storage.getUChar("lfoType", 0);
@@ -3843,6 +4171,15 @@ void loadSettings() {
   state.rainWet = storage.getUChar("rainWet", 114);
   state.rainSplsh = storage.getUChar("rainSplsh", 0);
   state.rainThunder = storage.getBool("rainThndr", false);
+  // TWST-параметры
+  state.twstDebr = storage.getUChar("twDebr", 0);
+  if (state.twstDebr > TWST_MAX_DEBR) state.twstDebr = 0;
+  state.twstRads = storage.getUChar("twRads", 0);
+  if (state.twstRads >= TWST_RADS) state.twstRads = 0;
+  state.twstScat = storage.getUChar("twScat", 0);
+  if (state.twstScat >= TWST_SCATS) state.twstScat = 0;
+  state.twstGust = storage.getUChar("twGust", 0);
+  if (state.twstGust > 127) state.twstGust = 0;
 
   state.gateMode = storage.getBool("gate", false);
   // Сохраняется/загружается только ВЫБОР режима (BYPASS/FREEZE) —
@@ -3914,6 +4251,7 @@ void engineLoop(void*) {
       lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
     }
     processRoll();
+    processTwst();
     processGates();
     midiPump();
     uint32_t last = lastInternalTickMicros;
@@ -3977,6 +4315,7 @@ uint32_t settingsSignature() {
   FNV_FIELD(h, state.sunRflct); FNV_FIELD(h, state.sunArp); FNV_FIELD(h, state.sunDflct); FNV_FIELD(h, state.sunBias);
   FNV_FIELD(h, state.snowFlake); FNV_FIELD(h, state.snowRotation); FNV_FIELD(h, state.snowFrz); FNV_FIELD(h, state.snowTime);
   FNV_FIELD(h, state.rainDrip); FNV_FIELD(h, state.rainWet); FNV_FIELD(h, state.rainSplsh); FNV_FIELD(h, state.rainThunder);
+  FNV_FIELD(h, state.twstDebr); FNV_FIELD(h, state.twstRads); FNV_FIELD(h, state.twstScat); FNV_FIELD(h, state.twstGust);
   FNV_FIELD(h, state.gateMode); FNV_FIELD(h, state.selectedBypassMode); FNV_FIELD(h, state.seqDest);
   FNV_FIELD(h, state.gfxEnabled);
   return h;
@@ -3994,6 +4333,7 @@ void setup() {
   pinMode(Pins::ENC_B, INPUT_PULLUP);
   Wire.begin(Pins::SDA, Pins::SCL);
   randomSeed(analogRead(0) + micros());
+  state.twstRng = (uint32_t)random(1, 0x7FFFFFFF);
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     while (1) delay(1000);
   }
@@ -4193,6 +4533,10 @@ void loop() {
         storage.putUChar("rainWet", state.rainWet);
         storage.putUChar("rainSplsh", state.rainSplsh);
         storage.putBool("rainThndr", state.rainThunder);
+        storage.putUChar("twDebr", state.twstDebr);
+        storage.putUChar("twRads", state.twstRads);
+        storage.putUChar("twScat", state.twstScat);
+        storage.putUChar("twGust", state.twstGust);
         state.needSaveStorm = false;
       }
       if (state.needSaveGlobal) {
