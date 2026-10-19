@@ -3319,11 +3319,50 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
   }
 }
 
-// Окно Freeze Roll поверх любой страницы: «ROLL» и размер (1/32), под ними бар длиной в
-// такт. Бар заполняется по ударам ролла и сбрасывается в начале такта; под ним линейка,
-// разделённая на столько частей, сколько ударов в такте (4 … 128): чем мельче доля, тем
-// короче отсечка, так что каждый размер добавляет свой ряд. MAX — частота упёрлась в то,
-// что успевает MIDI-линия.
+// Лампа ударов ролла (7×7 справа от «ROLL»). Пока удар длиннее двух кадров экрана, она
+// мигает честно — горит первую половину каждого удара. Быстрее экран мигать не успевает
+// (вышел бы стробоскоп), и лампа переходит на дизеринг, заново случайный на каждом ударе;
+// чем больше ударов приходится на кадр, тем мельче зерно: блоки 2×2 → шум по пикселю →
+// шахматка, инвертирующаяся каждый кадр (самое быстрое мерцание, какое может экран).
+// Пороги — от реального времени между кадрами, а не от заданной частоты обновления.
+void drawRollLamp(uint8_t x, uint8_t y, uint16_t fg, uint32_t hitUs, uint8_t phase,
+                  uint32_t hitNo, bool playing) {
+  static uint32_t lastFrameUs = 0;
+  static uint8_t flip = 0;
+  uint32_t now = micros();
+  uint32_t frameUs = now - lastFrameUs;
+  lastFrameUs = now;
+  if (frameUs < 10000) frameUs = 10000;
+  if (frameUs > 60000) frameUs = 60000;
+  flip ^= 1;
+  display.drawRect(x, y, 7, 7, fg);
+  if (!playing || hitUs == 0) return;
+  uint32_t perFrame10 = frameUs * 10 / hitUs;   // ударов за кадр × 10
+  for (uint8_t dy = 0; dy < 5; dy++) {
+    for (uint8_t dx = 0; dx < 5; dx++) {
+      bool on;
+      if (perFrame10 < 5) {
+        on = phase < 128;
+      } else if (perFrame10 < 30) {
+        uint32_t gx = dx, gy = dy;
+        if (perFrame10 < 15) { gx >>= 1; gy >>= 1; }
+        uint32_t h = gx * 73856093u ^ gy * 19349663u ^ hitNo * 83492791u;
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        on = h & 1;
+      } else {
+        on = (dx + dy + flip) & 1;
+      }
+      if (on) display.drawPixel(x + 1 + dx, y + 1 + dy, fg);
+    }
+  }
+}
+
+// Окно Freeze Roll поверх любой страницы. Сверху «ROLL», лампа ударов и размер (1/32).
+// Ниже бар-тахометр: его длина — скорость (каждая ступень 1/4…1/128 удлиняет его на
+// шестую), стрелка на конце плавно доезжает до новой ступени. Внутри бара — огибающие нот:
+// каждая выходит из стрелки и уезжает влево, окно — одна доля, так что чем мельче размер,
+// тем гуще зубцы; в GATE между ними паузы. Под баром шкала 4…128, текущая ступень
+// инвертирована. MAX — частота упёрлась в то, что успевает MIDI-линия.
 void drawRollOverlay(bool bypass) {
   uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
@@ -3332,39 +3371,82 @@ void drawRollOverlay(bool bypass) {
   display.drawRect(bx, by, bw, bh, fg);
   display.setTextSize(1);
   display.setTextColor(fg);
-  display.setCursor(bx + 4, by + 3);
+  display.setCursor(bx + 4, by + 2);
   display.print("ROLL");
   int16_t x1, y1; uint16_t w, h;
   if (rollStepEmpty()) {
     display.getTextBounds("EMPTY", 0, 0, &x1, &y1, &w, &h);
-    display.setCursor(bx + (bw - w) / 2, by + 14);
+    display.setCursor(bx + (bw - w) / 2, by + 12);
     display.print("EMPTY");
     return;
   }
   uint8_t eff = rollEffectiveIndex();
+
+  // Стрелка доезжает плавно; если окно только что открылось — сразу на место.
+  static float lvl = 0;
+  static uint32_t lastDrawMs = 0;
+  if (millis() - lastDrawMs > 200) lvl = eff;
+  lastDrawMs = millis();
+  lvl += ((float)eff - lvl) * 0.35f;
+
+  // Позиция в 1/256 четверти такта Clock: целые такты от первого шага плюс доля текущего
+  // по времени. Доля (24 такта) кратна интервалу любой ступени, поэтому огибающие можно
+  // считать по остатку внутри доли и не бояться переполнения.
+  bool playing = state.sequencerRunning && !state.sequencerStartPending;
+  uint32_t period = tickPeriodUs();
+  uint16_t q = rollQ[eff];
+  uint32_t qU = (uint32_t)q * 256;
+  const uint32_t BEAT_U = 24 * 1024;
+  uint32_t ticks = state.midiTicks - state.seqOriginTick;
+  uint32_t dt = micros() - state.lastTickMicros;
+  uint32_t sub = (dt >= period) ? 1023 : dt * 1024 / period;
+  uint32_t total = ticks * 1024 + sub;
+  uint32_t base = (ticks % 24) * 1024 + sub;
+
+  drawRollLamp(bx + 30, by + 2, fg, (uint32_t)q * period / 4, (base % qU) * 256 / qU,
+               rollPosQ() / q, playing);
   if (eff == rollMaxIndex() && eff < ROLL_STEPS - 1) {
-    display.setCursor(bx + 34, by + 3);
+    display.setCursor(bx + 40, by + 2);
     display.print("MAX");
   }
   display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
-  display.setCursor(bx + bw - 4 - w, by + 3);
+  display.setCursor(bx + bw - 4 - w, by + 2);
   display.print(rollNames[eff]);
 
-  const uint8_t barX = bx + 5, barW = 112, barY = by + 12, barH = 5, rulerY = barY + barH + 2;
-  const uint16_t barQ = 384;                 // такт в четвертях такта Clock
-  const uint16_t divs = 4u << eff;           // ударов в такте: 4, 8 … 128
-  display.drawRect(barX - 1, barY - 1, barW + 2, barH + 2, fg);
-  if (state.sequencerRunning && !state.sequencerStartPending) {
-    uint32_t done = (rollPosQ() % barQ) / rollQ[eff] + 1;  // удары такта, включая текущий
-    display.fillRect(barX, barY, (uint8_t)(done * barW / divs), barH, fg);
+  const int16_t barX = bx + 5, barW = 112, top = by + 10, A = 7, bot = top + A - 1;
+  auto levelX = [&](float l) -> int16_t { return barX + (int16_t)((l + 1.0f) * barW / 6.0f + 0.5f) - 1; };
+  for (int16_t x = barX; x < barX + barW; x += 2) display.drawPixel(x, bot + 1, fg);
+  int16_t fx = levelX(lvl);
+  if (playing) {
+    for (int16_t x = barX; x <= fx; x++) {
+      uint32_t off = (uint32_t)(fx - x) * BEAT_U / barW;
+      if (ticks < 24 && total < off) continue;   // в первой доле: до первого шага ударов не было
+      uint32_t l = ((base + BEAT_U - off) % qU) * 256 / qU;   // 0..255 внутри удара
+      uint32_t e = state.gateMode ? (l < 128 ? 255 - 2 * l : 0) : 255 - l;
+      uint8_t hgt = (e * A + 127) / 255;
+      if (hgt) display.drawFastVLine(x, bot - hgt + 1, hgt, fg);
+    }
   }
-  for (uint16_t k = 0; k <= divs; k++) {
-    uint8_t len = 1;
-    if (k % (divs / 4) == 0) len = 5;
-    else if (divs >= 8 && k % (divs / 8) == 0) len = 4;
-    else if (divs >= 16 && k % (divs / 16) == 0) len = 3;
-    else if (divs >= 32 && k % (divs / 32) == 0) len = 2;
-    display.drawFastVLine(barX + (uint16_t)(k * barW / divs), rulerY, len, fg);
+  display.drawFastVLine(fx + 1, top - 1, A + 2, fg);
+
+  // Шкала: подписи по центру своих ступеней, справа налево без наложений.
+  int16_t lx[ROLL_STEPS];
+  uint16_t lw[ROLL_STEPS];
+  for (int8_t i = ROLL_STEPS - 1; i >= 0; i--) {
+    display.getTextBounds(rollLabels[i], 0, 0, &x1, &y1, &lw[i], &h);
+    lx[i] = (i == ROLL_STEPS - 1) ? bx + bw - 4 - lw[i] : levelX(i) - lw[i] / 2;
+    if (i < ROLL_STEPS - 1 && lx[i] > lx[i + 1] - (int16_t)lw[i] - 2) lx[i] = lx[i + 1] - lw[i] - 2;
+    display.drawPixel(levelX(i), bot + 1, fg);
+  }
+  for (uint8_t i = 0; i < ROLL_STEPS; i++) {
+    if (i == eff) {
+      display.fillRect(lx[i] - 1, bot + 2, lw[i] + 1, 7, fg);
+      display.setTextColor(bg);
+    } else {
+      display.setTextColor(fg);
+    }
+    display.setCursor(lx[i], bot + 2);
+    display.print(rollLabels[i]);
   }
 }
 
@@ -4390,7 +4472,8 @@ void loop() {
   if (state.rollActive && millis() - state.rollLastTurnMs >= 2000) stopRoll();
 
   static uint32_t lastAnimTime = 0;
-  if (millis() - lastAnimTime >= 50) {
+  // Пока открыто окно Freeze Roll — 40 кадров/с вместо 20, чтобы бежали огибающие и мигала лампа.
+  if (millis() - lastAnimTime >= (state.rollActive ? 25u : 50u)) {
     lastAnimTime = millis();
     if (state.bypassMode == BypassMode::FREEZE && !state.animationPaused) {
       state.animationPaused = true;
