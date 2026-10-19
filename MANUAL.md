@@ -9,7 +9,7 @@ This firmware was developed for the **ESPidi** hardware platform, designed by **
 1. [Controls](#1-controls)
 2. [Pages overview](#2-pages-overview)
 3. [MAIN page](#3-main-page)
-4. [CC page](#4-cc-page)
+4. [MIDI page](#4-midi-page)
 5. [STORM page](#5-storm-page)
 6. [SEQUENCER page](#6-sequencer-page)
 7. [The five weather engines](#7-the-five-weather-engines)
@@ -46,13 +46,12 @@ Holding **TAP** while pressing another button changes what that button does almo
 ### TAP
 
 - **Double-click**: start/stop the sequencer.
-- **Hold + press ENC_SW**: advances the sequencer step cursor (SEQUENCER page, step view).
-- **Hold while turning the encoder**: coarser step size on STORM and SEQUENCER. On MAIN it edits the parameter's CC number, on the MAIN subpage — **max**, on CC — **Seq Trig**.
+- **Hold while turning the encoder**: coarser step size on STORM and SEQUENCER. On MAIN it edits the parameter's CC number, on the MAIN subpage — **max**, on MIDI — **Seq Trig**.
 - **Hold while pressing PAGE**: cycles the *subpage* instead of the page; held for 3s together with PAGE, randomizes all sequencer steps (same as TAP+PLAY above).
 
 ### PAGE
 
-- **Press**: next page (MAIN → CC → STORM → SEQUENCER → MAIN →).
+- **Press**: next page (MAIN → MIDI → STORM → SEQUENCER → MAIN →).
 - **TAP+PAGE**: subpage of the current page.
 - Also cancels a pending MIDI Learn, if one is active — a safety net so you're never stuck waiting.
 
@@ -61,16 +60,17 @@ Holding **TAP** while pressing another button changes what that button does almo
 Click count matters, and it's judged independently for double- and triple-clicks — a slow triple-click just looks like a single click followed by a double-click, not a mis-fire.
 
 - **Single click, TAP held**: cycles which of the 4 columns is selected.
-- **Single click, TAP not held**: arms a 3-second hold. Border blinks from 1s; release before 3s and nothing happens. Hold to 3s and the current page/subpage resets to its defaults.
+- **Single click, TAP not held**: arms a 3-second hold. Border blinks from 1s; release before 3s and nothing happens. Hold to 3s and the current page/subpage resets to its defaults. Turning the encoder while it's held cancels the reset.
+- **Hold and turn**: on the SEQUENCER step view, moves the step cursor (right — forward, wrapping around). Never triggers the reset.
 - **Double-click**: on MAIN or STORM (main subpage), toggles **manual freeze** on the selected parameter. On the SEQUENCER step view, toggles that step's active flag for the selected column.
-- **Triple-click**: on the CC page (channel view), or on the SEQUENCER setup subpage with the CC column selected — arms **MIDI Learn** (see [§9](#9-midi-learn)).
+- **Triple-click**: on the MIDI page (channel view), or on the SEQUENCER setup subpage with the CC column selected — arms **MIDI Learn** (see [§9](#9-midi-learn)).
 - **Any click while MIDI Learn is waiting**: cancels it.
 
 ---
 
 ## 2. Pages overview
 
-Press **PAGE** to cycle: **MAIN → CC → STORM → SEQUENCER**. Each page (except SEQUENCER) shows a page counter (`n/4`) and a running-state indicator (`>` running / `|` stopped) in the top-right corner. Every page has their own subpage, reached with **TAP+PAGE**.
+Press **PAGE** to cycle: **MAIN → MIDI → STORM → SEQUENCER**. Each page (except SEQUENCER) shows a page counter (`n/4`) and a running-state indicator (`>` running / `|` stopped) in the top-right corner. Every page has their own subpage, reached with **TAP+PAGE**.
 
 ---
 
@@ -85,7 +85,7 @@ Double-click **[ENC_SW]** to manually freeze the selected parameter (frost anima
 
 ---
 
-## 4. CC page
+## 4. MIDI page
 
 Routes P1–P4: which MIDI channel each one sends on, and where notes go.
 
@@ -126,9 +126,9 @@ The heart of the algorithmic engine.
 
 ## 6. SEQUENCER page
 
-A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-step retrigger rate. Notes and the CC column go to the Seq Trig channels ([§4](#4-cc-page)); note length follows **LEN**.
+A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-step retrigger rate. Notes and the CC column go to the Seq Trig channels ([§4](#4-midi-page)); note length follows **LEN**.
 
-- **Page** (step view) — the 16-step row along the top; the four columns below (NOTE / CC / *destination* / RTRG) edit the step under the cursor. Move the cursor with **[TAP+ENC_SW]**. Select a column with **[ENC_SW (TAP held)]**; edit it with the encoder. Double-click **[ENC_SW]** to toggle that column active on the current step.
+- **Page** (step view) — the 16-step row along the top; the four columns below (NOTE / CC / *destination* / RTRG) edit the step under the cursor. Move the cursor by holding **[ENC_SW]** and turning the encoder. Select a column with **[ENC_SW (TAP held)]**; edit it with the encoder. Double-click **[ENC_SW]** to toggle that column active on the current step.
   - **RTRG** — once a step is active, this makes it re-trigger repeatedly at a fixed subdivision (1/4 down to 1/64) for as long as the step stays active, instead of firing once.
 - **Subpage** (setup):
   - **BPM** — internal tempo, used when no external MIDI clock is present. Shows the detected tempo instead (read-only) whenever an external clock is running.
@@ -216,7 +216,7 @@ On every hit, P1–P4 mutate as usual (scaled by AMT) — and independently, **F
 | SCAT | 1/8 / 1/4 / 1/2 / 1 / 2 bars | Window the copies fall into |
 | GUST | 0–127 | How hard each impact knocks P1–P4 |
 
-TWST listens to the MIDI input — Note On/Off on any channel. Every incoming note plays immediately on the Seq Trig channels ([§4](#4-cc-page)), and `DEBR` copies follow it, each on a random position inside the `SCAT` window (never two on the same position), at a random pitch from `RADS`, with the same velocity. Releasing the key ends the original note; copies already in the air keep falling. The DEBR column shows the impact point with one dot per copy.
+TWST listens to the MIDI input — Note On/Off on any channel. Every incoming note plays immediately on the Seq Trig channels ([§4](#4-midi-page)), and `DEBR` copies follow it, each on a random position inside the `SCAT` window (never two on the same position), at a random pitch from `RADS`, with the same velocity. Releasing the key ends the original note; copies already in the air keep falling. The DEBR column shows the impact point with one dot per copy.
 
 **RADS**: `0` = the same note, `OCT` = ±1 octave, `5+8` = ±fifth or ±octave, `2OCT` = ±1 or ±2 octaves, `CHR` = any semitone within ±1 octave. Octaves and fifths fit any key; `CHR` is for chaos.
 
@@ -242,7 +242,7 @@ Incoming notes are used only by TWST; the other engines ignore them, and RED SEA
 
 ## 8. Performance modes — BYPASS & FREEZE
 
-One button (**PLAY**) engages whichever mode is currently selected on the CC page (`BYP` = BYPASS, `FRZ` = FREEZE). It's designed for live use: press to slam it on instantly
+One button (**PLAY**) engages whichever mode is currently selected on the MIDI page (`BYP` = BYPASS, `FRZ` = FREEZE). It's designed for live use: press to slam it on instantly
 
 ### BYPASS
 
@@ -254,11 +254,11 @@ Freezes **all eight** targets at once (P1–P4, AMT, WAV, WTH, ARM) — invertin
 
 ### Freeze Roll
 
-While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `ROLL`, the current rate, and the scale `4 8 16 32 64 128` with the current rate highlighted.
+While FREEZE is on and you're **holding PLAY**, turning the encoder rolls the looped step: it repeats on a grid from 1/4 to 1/128 — right is faster, left is slower. A window over the page shows `ROLL`, the current rate (`1/32`), and a bar one measure long: it fills hit by hit and starts over at each new measure. A ruler under the bar splits the measure into as many parts as there are hits in it — 4 at 1/4, up to 128 at 1/128 — so the finer the rate, the denser the ruler.
 
 - The first click starts from what's playing now — the step length (1/16 × SCALE) or the step's retrigger, whichever is faster — and moves it one notch.
 - Hits are timed against the sequencer's grid: after a rate change, the next hit lands on the nearest division of the new grid. 1/64 and 1/128 are exact even though they fall between MIDI clock ticks.
-- The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; rates out of reach are dimmed on the scale.
+- The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; `MAX` next to `ROLL` means the rate has hit that limit.
 - `EMPTY` in the window means nothing is active on the step.
 - The roll stops when you release PLAY, after 2 seconds without turning, or when FREEZE turns off. Nothing is saved — the step's retrigger stays as it was.
 - Like the FREEZE loop itself, the roll plays only while the sequencer is running.
@@ -278,7 +278,7 @@ The roll is a hold gesture: press PLAY (FREEZE engages), keep holding, turn. If 
 Instead of dialing in a CC number and channel by hand, grab them straight from your controller — or from the device you want to control: turn a knob on a drum machine track connected to the MIDI input, and the parameter will send exactly there.
 
 **Triple-click ENC_SW** on:
-- the CC page (channel view) — learns both the CC number and the channel for the parameter under the cursor, or
+- the MIDI page (channel view) — learns both the CC number and the channel for the parameter under the cursor, or
 - the SEQUENCER setup subpage, with the CC column selected — learns the sequencer's CC number (only the number: the sequencer CC goes to the Seq Trig channels).
 
 A banner reading *"Waiting for midi data"* appears. Move a control on whatever's connected to the MIDI input — the next Control Change message received (on any channel) is captured, assigned, and the banner disappears. Any button press cancels the wait without assigning anything, and leaving the page does the same automatically.
@@ -311,14 +311,14 @@ Updating from the first release: the old global MIDI channel is copied to all fo
 | PAGE                          | Next page                                                   |
 | TAP+PAGE                      | Subpage of current Page                                     |
 | TAP double-click              | Start/stop sequencer                                        |
-| TAP+ENC_SW                    | Move sequencer step cursor                                  |
+| ENC_SW hold + encoder turn    | Move sequencer step cursor (SEQUENCER)                      |
 | ENC_SW (TAP held)             | Cycle selected column                                       |
 | ENC_SW (TAP free), hold 3s    | Reset current page/subpage to defaults                      |
 | ENC_SW double-click           | Manual freeze (MAIN/STORM) / toggle step column (SEQUENCER) |
-| ENC_SW triple-click           | MIDI Learn (CC page — number + channel / sequencer CC)      |
+| ENC_SW triple-click           | MIDI Learn (MIDI page — number + channel / sequencer CC)    |
 | PLAY press                    | Engage/exit BYPASS or FREEZE instantly                      |
 | PLAY hold 0.75s + release     | Exit BYPASS/FREEZE                                          |
 | PLAY hold + encoder turn      | Freeze Roll (in FREEZE)                                     |
 | PLAY+TAP                      | Randomize current page/parameter                            |
 | TAP+PLAY or TAP+PAGE, hold 3s | Randomize all sequencer steps                               |
-| Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (CC) |
+| Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (MIDI) |

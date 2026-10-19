@@ -2008,14 +2008,6 @@ void updateButtons() {
             continue;
           }
 
-          if (buttons[3].lastStable == LOW && state.currentPage == Page::SEQUENCER && state.subPageSequencer == 0) {
-            state.sequencerCursor = (state.sequencerCursor + 1) % state.sequencerSteps;
-            b.processed = true;
-            state.lastTapReleaseTime = 0;
-            tapWasReleased = false;
-            continue;
-          }
-
           state.tapDoubleClicked = false;
           state.lastTapReleaseTime = 0;
           tapWasReleased = false;
@@ -2257,6 +2249,25 @@ void handleEncoderDetent(int mov) {
   if (buttons[0].lastStable == LOW) {
     if (state.bypassMode == BypassMode::FREEZE) rollTurn(mov);
     return;
+  }
+
+  // Зажатый энкодер + вращение. Сброс страницы — это удержание БЕЗ вращения, поэтому любой
+  // поворот отменяет его отсчёт. На шагах секвенсора поворот двигает курсор шага (вправо —
+  // вперёд, по кругу), а следующее нажатие не считается вторым кликом двойного.
+  if (buttons[3].lastStable == LOW) {
+    if (state.encLongPressActive) {
+      state.encLongPressActive = false;
+      state.encLongPressFrameVisible = false;
+      state.displayDirty = true;
+    }
+    if (state.currentPage == Page::SEQUENCER && state.subPageSequencer == 0) {
+      uint8_t n = state.sequencerSteps;
+      state.sequencerCursor = (uint8_t)((state.sequencerCursor + (mov > 0 ? 1 : n - 1)) % n);
+      state.encSWLastPress = 0;
+      state.encSWTripleCount = 0;
+      state.displayDirty = true;
+      return;
+    }
   }
 
   // SEQUENCER main
@@ -3231,7 +3242,7 @@ void drawSailboat(uint8_t x, uint8_t y, uint32_t time, uint8_t amt, bool bypass=
 }
 
 // ----- Заголовок и страницы -----
-const char* pageNames[] = {"Main", "CC", "Storm", ""};
+const char* pageNames[] = {"Main", "MIDI", "Storm", ""};
 const char* paramNames[4][4] = {
   {"P1","P2","P3","P4"},
   {"P1","P2","P3","P4"},
@@ -3308,12 +3319,15 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
   }
 }
 
-// Окно Freeze Roll поверх любой страницы: «ROLL» и текущая частота, под ними шкала из
-// шести ступеней — текущая инвертирована, те, что MIDI-линия сейчас не успевает, приглушены.
+// Окно Freeze Roll поверх любой страницы: «ROLL» и размер (1/32), под ними бар длиной в
+// такт. Бар заполняется по ударам ролла и сбрасывается в начале такта; под ним линейка,
+// разделённая на столько частей, сколько ударов в такте (4 … 128): чем мельче доля, тем
+// короче отсечка, так что каждый размер добавляет свой ряд. MAX — частота упёрлась в то,
+// что успевает MIDI-линия.
 void drawRollOverlay(bool bypass) {
   uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
-  const uint8_t bx = 3, by = 4, bw = Display::W - 6, bh = 25;
+  const uint8_t bx = 3, by = 3, bw = Display::W - 6, bh = 26;
   display.fillRect(bx - 1, by - 1, bw + 2, bh + 2, bg);
   display.drawRect(bx, by, bw, bh, fg);
   display.setTextSize(1);
@@ -3328,25 +3342,29 @@ void drawRollOverlay(bool bypass) {
     return;
   }
   uint8_t eff = rollEffectiveIndex();
-  uint8_t maxIdx = rollMaxIndex();
+  if (eff == rollMaxIndex() && eff < ROLL_STEPS - 1) {
+    display.setCursor(bx + 34, by + 3);
+    display.print("MAX");
+  }
   display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
   display.setCursor(bx + bw - 4 - w, by + 3);
   display.print(rollNames[eff]);
-  const uint8_t cw = 19, gap = 1, cy = by + 13, ch = 10;
-  uint8_t cx0 = bx + (bw - (ROLL_STEPS * cw + (ROLL_STEPS - 1) * gap)) / 2;
-  for (uint8_t i = 0; i < ROLL_STEPS; i++) {
-    uint8_t cx = cx0 + i * (cw + gap);
-    bool cur = (i == eff);
-    if (cur) display.fillRect(cx, cy, cw, ch, fg);
-    display.setTextColor(cur ? bg : fg);
-    display.getTextBounds(rollLabels[i], 0, 0, &x1, &y1, &w, &h);
-    display.setCursor(cx + (cw - w) / 2, cy + 1);
-    display.print(rollLabels[i]);
-    if (i > maxIdx) {
-      for (uint8_t yy = cy; yy < cy + ch; yy++)
-        for (uint8_t xx = cx; xx < cx + cw; xx++)
-          if ((xx + yy) & 1) display.drawPixel(xx, yy, bg);
-    }
+
+  const uint8_t barX = bx + 5, barW = 112, barY = by + 12, barH = 5, rulerY = barY + barH + 2;
+  const uint16_t barQ = 384;                 // такт в четвертях такта Clock
+  const uint16_t divs = 4u << eff;           // ударов в такте: 4, 8 … 128
+  display.drawRect(barX - 1, barY - 1, barW + 2, barH + 2, fg);
+  if (state.sequencerRunning && !state.sequencerStartPending) {
+    uint32_t done = (rollPosQ() % barQ) / rollQ[eff] + 1;  // удары такта, включая текущий
+    display.fillRect(barX, barY, (uint8_t)(done * barW / divs), barH, fg);
+  }
+  for (uint16_t k = 0; k <= divs; k++) {
+    uint8_t len = 1;
+    if (k % (divs / 4) == 0) len = 5;
+    else if (divs >= 8 && k % (divs / 8) == 0) len = 4;
+    else if (divs >= 16 && k % (divs / 16) == 0) len = 3;
+    else if (divs >= 32 && k % (divs / 32) == 0) len = 2;
+    display.drawFastVLine(barX + (uint16_t)(k * barW / divs), rulerY, len, fg);
   }
 }
 
