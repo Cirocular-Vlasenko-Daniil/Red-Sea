@@ -469,7 +469,6 @@ struct State {
   uint8_t subPageCC = 0;
   uint8_t subPageSequencer = 0;
   uint8_t subPageStorm = 0;
-  bool editMin = true;
 
   // Анимация
   bool animationPaused = false;
@@ -3024,10 +3023,10 @@ void drawTwister(uint32_t time, uint8_t amt, bool bypass=false) {
   if (!state.gfxEnabled) return;
   uint16_t color = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   float t = time / 1000.0f;
-  int16_t cx = 100 + (int16_t)(animSin(t * 0.3f) * 10.0f);
+  int16_t cx = 88 + (int16_t)(animSin(t * 0.3f) * 6.0f);
   float spin = t * (3.0f + amt / 25.0f);
   for (uint8_t y = 0; y < 17; y++) {
-    float r = 1.0f + (16 - y) * 0.55f;
+    float r = 1.0f + (16 - y) * 0.45f;
     int16_t bend = (int16_t)(animSin(t * 0.8f + y * 0.15f) * (16 - y) * 0.15f);
     for (uint8_t k = 0; k < 3; k++) {
       float a = spin + y * 0.45f + k * 2.094f;
@@ -3250,19 +3249,20 @@ const char* paramNames[4][4] = {
   {"","","",""}
 };
 
-void drawHeader(Page page, uint8_t sel, bool bypass=false) {
+// Возвращает x, где закончился текст заголовка: кораблик встаёт не левее него.
+uint8_t drawHeader(Page page, uint8_t sel, bool bypass=false) {
   uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
   if (state.bypassMode == BypassMode::FREEZE && page != Page::SEQUENCER) {
     drawTextWithOutline(2, 2, "FROZEN", fg, bg);
-    return;
+    return 40;
   }
   // BYPASS ничего не морозит (движок работает как обычно), поэтому
   // не переворачивает цвета всей страницы — bypass здесь останется
   // false, и баннер рисуется обычными цветами.
   if (state.bypassMode == BypassMode::BYPASS && page != Page::SEQUENCER) {
     drawTextWithOutline(2, 2, "BYPASS", fg, bg);
-    return;
+    return 40;
   }
   uint8_t idx = (uint8_t)page;
   const char* pName = pageNames[idx];
@@ -3317,6 +3317,7 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
   } else if (showSub) {
     drawTextWithOutline(120, y, "S", fg, bg);
   }
+  return (uint8_t)x;
 }
 
 // Лампа ударов ролла (7×7 справа от заголовка). Пока удар длиннее двух кадров экрана, она
@@ -3412,7 +3413,7 @@ void drawRollOverlay(bool bypass) {
   display.print(rollNames[eff]);
 
   const int16_t barX = bx + 5, barW = 112, top = by + 10, A = 7, bot = top + A - 1;
-  auto levelX = [&](float l) -> int16_t { return barX + (int16_t)((l + 1.0f) * barW / 6.0f + 0.5f) - 1; };
+  auto levelX = [&](float l) -> int16_t { return barX + (int16_t)((l + 0.5f) * barW / 6.0f + 0.5f); };
   for (int16_t x = barX; x < barX + barW; x += 2) display.drawPixel(x, bot + 1, fg);
   int16_t fx = levelX(lvl);
   if (playing) {
@@ -3468,8 +3469,8 @@ void drawMain(bool bypass) {
   uint8_t amt = state.chaos;
   drawSeaLines(animTime, amt, bypass);
   drawWeather(animTime, amt, bypass);
-  drawHeader(Page::MAIN, state.selectedParam, bypass);
-  drawSailboat(64, 0, animTime, amt, bypass);
+  uint8_t hx = drawHeader(Page::MAIN, state.selectedParam, bypass);
+  drawSailboat(hx > 64 ? hx : 64, 0, animTime, amt, bypass);
   if (state.subPageMain == 0) {
     // Пока зажат TAP, энкодер правит номер CC — колонки подписаны номерами, а не значениями.
     // С задержкой 200 мс: короткие нажатия (двойной TAP — старт/стоп) не мигают подписями.
@@ -3498,8 +3499,11 @@ void drawMain(bool bypass) {
       sprintf(buf, "%3d", state.params[i].max);
       display.setCursor(x+14, Display::METER_Y+Display::METER_H-10); display.print(buf);
       if (state.selectedParam == i) {
-        uint8_t yy = state.editMin ? Display::METER_Y+2 : Display::METER_Y+Display::METER_H-10;
-        display.drawRect(x+12, yy-1, 16, 8, fg);
+        // Подчёркнуто то, что правит энкодер: без TAP — min, с TAP — max. Цветом текста:
+        // прежняя рамка цвета заливки была не видна и только стирала пиксели цифр.
+        bool editMax = (buttons[1].lastStable == LOW);
+        uint8_t yy = editMax ? Display::METER_Y+Display::METER_H-10 : Display::METER_Y+2;
+        display.drawFastHLine(x+14, yy+7, 17, bg2);
       }
     }
   }
@@ -3542,8 +3546,8 @@ void drawCC(bool bypass) {
   uint8_t amt = state.chaos;
   drawSeaLines(animTime, amt, bypass);
   drawWeather(animTime, amt, bypass);
-  drawHeader(Page::CC, state.selectedParam, bypass);
-  drawSailboat(64, 0, animTime, amt, bypass);
+  uint8_t hx = drawHeader(Page::CC, state.selectedParam, bypass);
+  drawSailboat(hx > 64 ? hx : 64, 0, animTime, amt, bypass);
   if (state.subPageCC == 0) {
     for (uint8_t i=0; i<NUM_PARAMS; i++)
       drawChannelColumn(i*32, state.params[i].ch, state.params[i].seqTrig, state.selectedParam==i, bypass);
@@ -3651,8 +3655,8 @@ void drawStorm(bool bypass) {
   uint8_t amt = state.chaos;
   drawSeaLines(animTime, amt, bypass);
   drawWeather(animTime, amt, bypass);
-  drawHeader(Page::STORM, state.selectedParam, bypass);
-  drawSailboat(64, 0, animTime, amt, bypass);
+  uint8_t hx = drawHeader(Page::STORM, state.selectedParam, bypass);
+  drawSailboat(hx > 64 ? hx : 64, 0, animTime, amt, bypass);
   drawColumn(0, map(state.chaos, 0, 100, 0, 127), state.selectedParam==0, animTime, amt, bypass, state.frozenAmt);
   uint8_t interval = waveIntervals[state.waveIntervalIndex];
   uint32_t currentPos = state.midiTicks % interval;
@@ -3683,8 +3687,8 @@ void drawStormSubpage(bool bypass) {
   uint8_t amt = state.chaos;
   drawSeaLines(animTime, amt, bypass);
   drawWeather(animTime, amt, bypass);
-  drawHeader(Page::STORM, state.selectedParam, bypass);
-  drawSailboat(64, 0, animTime, amt, bypass);
+  uint8_t hx = drawHeader(Page::STORM, state.selectedParam, bypass);
+  drawSailboat(hx > 64 ? hx : 64, 0, animTime, amt, bypass);
 
   if (state.weatherMode == WeatherMode::FOG) {
     // Унифицировано с SUN/SNOW/RAIN: выбранная колонка заливается
