@@ -223,12 +223,17 @@ const uint8_t SEQ_COL_ORDER[4] = {0, 2, 1, 3};
 // ============================================================
 // 3. СТРУКТУРЫ ДАННЫХ
 // ============================================================
+// Канал 0 — NO: параметр никуда не отправляет ни CC, ни ноты.
+constexpr uint8_t CH_NONE = 0;
+
 struct Param {
   uint8_t cc;
   uint8_t value;
   uint8_t min;
   uint8_t max;
   uint8_t baseValue;
+  uint8_t ch;       // 0 = NO, 1..16
+  bool seqTrig;     // ноты секвенсора (и ARP у SUN) уходят и на канал этого параметра
 };
 
 struct SequencerStep {
@@ -242,8 +247,8 @@ struct SequencerStep {
 struct State {
   // MAIN
   Param params[NUM_PARAMS] = {
-    {00, 00, 0, 127, 00}, {00, 00, 0, 127, 00},
-    {00, 00, 0, 127, 00}, {00, 00, 0, 127, 00}
+    {00, 00, 0, 127, 00, 1, true}, {00, 00, 0, 127, 00, 1, true},
+    {00, 00, 0, 127, 00, 1, true}, {00, 00, 0, 127, 00, 1, true}
   };
   bool frozen[NUM_PARAMS] = {false};
   bool frozenActive = false;
@@ -272,6 +277,12 @@ struct State {
   bool sunArpActive[NUM_PARAMS] = {false};
   uint8_t sunArpBaseNote[NUM_PARAMS] = {0};
   uint8_t sunArpLastNote[NUM_PARAMS] = {0};
+  // Звучащая нота арпеджио и канал, на котором она ушла: Note Off идёт туда же, даже если
+  // канал параметра успели поменять. В GATE нота гаснет сама в sunArpOffAt (micros).
+  bool sunArpSounding[NUM_PARAMS] = {false};
+  uint8_t sunArpCh[NUM_PARAMS] = {0};
+  bool sunArpGatePending[NUM_PARAMS] = {false};
+  uint32_t sunArpOffAt[NUM_PARAMS] = {0};
   // Тик, на котором секвенсор реально отправил Note On (обычный шаг
   // ИЛИ внутришаговый ретриггер) — используется для проверки строгого
   // совпадения по тику при аресте серии RFLCT.
@@ -360,8 +371,12 @@ struct State {
   bool sequencerStartPending = false;
   bool sequencerStartOnBeat = false;
   // Нота секвенсора, которая сейчас звучит (-1 — нет): Note Off ей уходит перед следующей
-  // нотой, по Stop, при входе в BYPASS и смене канала.
+  // нотой, по Stop, при входе в BYPASS, а в GATE — сама в seqGateOffAt (micros).
+  // seqSoundingMask — каналы, на которые ушёл её Note On (бит ch-1).
   int16_t seqSoundingNote = -1;
+  uint16_t seqSoundingMask = 0;
+  bool seqGatePending = false;
+  uint32_t seqGateOffAt = 0;
   // millis() последнего принятого 0xF8 — внешний Clock «жив», даже если не было Start.
   uint32_t extClockLastMs = 0;
 
@@ -389,7 +404,9 @@ struct State {
   volatile float bpm = 0.0f;
 
   // ----- ГЛОБАЛЬНЫЕ НАСТРОЙКИ -----
-  uint8_t midiChannel = 1;
+  // LEN: false — LEG (нота звучит до следующей), true — GATE (гаснет на середине
+  // интервала до следующего удара).
+  bool gateMode = false;
   BypassMode bypassMode = BypassMode::OFF;
   // OFF — не выбираемый режим, это просто "выключено". Пользователь
   // выбирает между BYPASS и FREEZE на подстранице CC.
@@ -464,8 +481,9 @@ struct State {
 
   // ----- MIDI LEARN -----
   // Тройной клик ENC_SW включает ожидание: следующее входящее
-  // CC-сообщение (с любого канала) переназначает CC-номер. Работает
-  // на двух страницах: CC (подстраница 0, курсор на P1-4) и SEQUENCER
+  // CC-сообщение (с любого канала) переназначает CC-номер, а параметру
+  // P1-4 — ещё и канал. Работает на двух страницах: CC (подстраница 0,
+  // курсор на P1-4) и SEQUENCER
   // (подстраница 1 "setup", курсор на колонке CC) — какая из целей,
   // определяет midiLearnSequencerCC.
   bool midiLearnActive = false;
@@ -662,22 +680,68 @@ void midiNoteToString(uint8_t note, char* out) {
 // ============================================================
 // BYPASS полностью глушит исходящий MIDI: движок (рандомайзер,
 // секвенсор, SNOW и т.д.) продолжает работать как обычно, но наружу
-// ничего не уходит — единая точка контроля для всех трёх функций
-// отправки, независимо от того, кто их вызвал.
-void sendCC(uint8_t cc, uint8_t val) {
-  if (state.bypassMode == BypassMode::BYPASS) return;
-  uint8_t status = 0xB0 | ((state.midiChannel - 1) & 0x0F);
-  midiMessage(status, cc & 0x7F, val & 0x7F);
+// ничего не уходит — единая точка контроля для всех функций
+// отправки, независимо от того, кто их вызвал. Канал NO (0) — тоже
+// ничего не уходит.
+void sendCCCh(uint8_t ch, uint8_t cc, uint8_t val) {
+  if (state.bypassMode == BypassMode::BYPASS || ch == CH_NONE) return;
+  midiMessage(0xB0 | ((ch - 1) & 0x0F), cc & 0x7F, val & 0x7F);
 }
-void sendNoteOn(uint8_t note, uint8_t vel) {
-  if (state.bypassMode == BypassMode::BYPASS) return;
-  uint8_t status = 0x90 | ((state.midiChannel - 1) & 0x0F);
-  midiMessage(status, note & 0x7F, vel & 0x7F);
+void sendNoteOnCh(uint8_t ch, uint8_t note, uint8_t vel) {
+  if (state.bypassMode == BypassMode::BYPASS || ch == CH_NONE) return;
+  midiMessage(0x90 | ((ch - 1) & 0x0F), note & 0x7F, vel & 0x7F);
 }
-void sendNoteOff(uint8_t note) {
-  if (state.bypassMode == BypassMode::BYPASS) return;
-  uint8_t status = 0x80 | ((state.midiChannel - 1) & 0x0F);
-  midiMessage(status, note & 0x7F, 0);
+void sendNoteOffCh(uint8_t ch, uint8_t note) {
+  if (state.bypassMode == BypassMode::BYPASS || ch == CH_NONE) return;
+  midiMessage(0x80 | ((ch - 1) & 0x0F), note & 0x7F, 0);
+}
+
+// CC параметра idx: его номер и текущее значение — на его канал.
+void sendParamCC(uint8_t idx) {
+  sendCCCh(state.params[idx].ch, state.params[idx].cc, state.params[idx].value);
+}
+
+// Наборы каналов — маска, бит ch-1. Одинаковые каналы у разных параметров схлопываются.
+inline uint16_t chBit(uint8_t ch) { return (ch >= 1 && ch <= 16) ? (uint16_t)(1u << (ch - 1)) : 0; }
+
+// Каналы нот секвенсора: каналы параметров с Seq Trig.
+uint16_t seqChannelMask() {
+  uint16_t m = 0;
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) if (state.params[i].seqTrig) m |= chBit(state.params[i].ch);
+  return m;
+}
+
+// Все каналы, куда что-либо уходит, — для All Notes Off.
+uint16_t usedChannelMask() {
+  uint16_t m = 0;
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) m |= chBit(state.params[i].ch);
+  return m;
+}
+
+void sendCCMask(uint16_t mask, uint8_t cc, uint8_t val) {
+  for (uint8_t ch = 1; ch <= 16; ch++) if (mask & chBit(ch)) sendCCCh(ch, cc, val);
+}
+void sendNoteOnMask(uint16_t mask, uint8_t note, uint8_t vel) {
+  for (uint8_t ch = 1; ch <= 16; ch++) if (mask & chBit(ch)) sendNoteOnCh(ch, note, vel);
+}
+void sendNoteOffMask(uint16_t mask, uint8_t note) {
+  for (uint8_t ch = 1; ch <= 16; ch++) if (mask & chBit(ch)) sendNoteOffCh(ch, note);
+}
+
+// Длительность такта MIDI Clock в мкс: при внешнем клоке — по измеренному темпу, иначе
+// по внутреннему BPM. Нужна, чтобы гасить ноты в GATE на середине интервала, который в
+// тактах бывает дробным (половина 1/32 — полтора такта).
+uint32_t internalTickPeriodUs();
+bool externalClockActive();
+uint32_t tickPeriodUs() {
+  if (externalClockActive() && state.bpm > 1.0f) return (uint32_t)(60000000.0f / (state.bpm * 24.0f));
+  return internalTickPeriodUs();
+}
+
+// Момент Note Off для GATE: половина интервала до следующего удара (в тактах).
+uint32_t gateOffTime(uint32_t intervalTicks) {
+  if (intervalTicks < 1) intervalTicks = 1;
+  return micros() + intervalTicks * tickPeriodUs() / 2;
 }
 
 inline int getRandomAmount() {
@@ -704,14 +768,33 @@ void armSunReflect(uint8_t idx, uint8_t level) {
   state.sunReflectNextTick[idx] = state.midiTicks + interval;
 }
 
+// Гасит звучащую ноту арпеджио параметра idx — на том канале, куда она ушла.
+void releaseSunArpNote(uint8_t idx) {
+  state.sunArpGatePending[idx] = false;
+  if (!state.sunArpSounding[idx]) return;
+  sendNoteOffCh(state.sunArpCh[idx], state.sunArpLastNote[idx]);
+  state.sunArpSounding[idx] = false;
+  // Та же нота секвенсора на этом канале теперь тоже погашена — снимаем канал с учёта,
+  // чтобы гейт секвенсора не погасил потом одноимённую ноту следующего отражения.
+  if (state.seqSoundingNote == state.sunArpLastNote[idx]) {
+    state.seqSoundingMask &= ~chBit(state.sunArpCh[idx]);
+    if (!state.seqSoundingMask) { state.seqSoundingNote = -1; state.seqGatePending = false; }
+  }
+}
+
 // Гасит зависшую арпеджио-ноту RFLCT (если была) и снимает флаг
 // активности для параметра idx — вызывается везде, где каскад
 // обрывается или не начинается (не только там, где заканчивается
 // естественным путём).
 void stopSunArp(uint8_t idx) {
-  if (!state.sunArpActive[idx]) return;
-  sendNoteOff(state.sunArpLastNote[idx]);
+  releaseSunArpNote(idx);
   state.sunArpActive[idx] = false;
+}
+
+// Ноты арпеджио идут на канал параметра, если у него включён Seq Trig: это повторы ноты
+// секвенсора, и на канал, куда секвенсор не играет, они не уходят.
+inline bool sunArpAllowed(uint8_t idx) {
+  return state.params[idx].seqTrig && state.params[idx].ch != CH_NONE;
 }
 
 void mutateParam(uint8_t idx) {
@@ -738,7 +821,7 @@ void mutateParam(uint8_t idx) {
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
       state.params[idx].value = (uint8_t)newVal;
       state.params[idx].baseValue = (uint8_t)newVal;
-      sendCC(state.params[idx].cc, state.params[idx].value);
+      sendParamCC(idx);
 
       // ----- ЛОГИКА RFLCT -----
       // Не шлём повтор мгновенно здесь (внутри одного вызова CC
@@ -753,10 +836,20 @@ void mutateParam(uint8_t idx) {
         // реально прозвучала на этом же тике (строгое совпадение).
         // Сама нота на старте не дублируется — секвенсор её уже
         // сыграл; арпеджио озвучивает именно последующие повторы.
-        if (state.sunArp != 0 && state.lastNoteOnTick == state.midiTicks) {
+        if (state.sunArp != 0 && state.lastNoteOnTick == state.midiTicks && sunArpAllowed(idx)) {
+          // Нота прежней серии ещё звучит — гасим, кроме случая, когда это та же нота
+          // на том же канале: секвенсор только что сыграл её заново.
+          uint8_t ch = state.params[idx].ch;
+          bool sameAsSeq = state.sunArpSounding[idx] && state.sunArpCh[idx] == ch &&
+                           state.sunArpLastNote[idx] == state.lastNote;
+          if (!sameAsSeq) releaseSunArpNote(idx);
           state.sunArpActive[idx] = true;
           state.sunArpBaseNote[idx] = state.lastNote;
+          // Первое отражение снимет ноту секвенсора на этом канале и сыграет транспонированную.
           state.sunArpLastNote[idx] = state.lastNote;
+          state.sunArpCh[idx] = ch;
+          state.sunArpSounding[idx] = true;
+          state.sunArpGatePending[idx] = false;
         } else {
           stopSunArp(idx);
         }
@@ -770,7 +863,7 @@ void mutateParam(uint8_t idx) {
       newVal += random(-amt, amt + 1);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
       state.params[idx].value = (uint8_t)newVal;
-      sendCC(state.params[idx].cc, state.params[idx].value);
+      sendParamCC(idx);
       break;
     case WeatherMode::RAIN: {
       newVal += random(-amt, amt + 1);
@@ -781,7 +874,7 @@ void mutateParam(uint8_t idx) {
       newVal = (int)(((long)newVal * (127 - state.rainWet) + (long)base * state.rainWet) / 127);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
       state.params[idx].value = (uint8_t)newVal;
-      sendCC(state.params[idx].cc, state.params[idx].value);
+      sendParamCC(idx);
 
       // SPLSH: капля, "приземлившаяся" за CLAMP, может задеть один из
       // соседних параметров небольшим случайным толчком.
@@ -792,7 +885,7 @@ void mutateParam(uint8_t idx) {
           int nv = state.params[neighbor].value + random(-splashAmt, splashAmt + 1);
           nv = clampU8(nv, state.params[neighbor].min, state.params[neighbor].max);
           state.params[neighbor].value = (uint8_t)nv;
-          sendCC(state.params[neighbor].cc, state.params[neighbor].value);
+          sendParamCC(neighbor);
         }
       }
       break;
@@ -804,7 +897,7 @@ void mutateParam(uint8_t idx) {
       newVal += random(-amt, amt + 1);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
       state.params[idx].value = (uint8_t)newVal;
-      sendCC(state.params[idx].cc, state.params[idx].value);
+      sendParamCC(idx);
       break;
   }
 }
@@ -822,7 +915,7 @@ void processRainThunder(int amt) {
   if (state.frozen[idx]) return;
   uint8_t extreme = (random(0, 2) == 0) ? state.params[idx].min : state.params[idx].max;
   state.params[idx].value = extreme;
-  sendCC(state.params[idx].cc, extreme);
+  sendParamCC(idx);
   state.rainStrikeActive = true;
   state.rainStrikeTime = millis();
 }
@@ -881,7 +974,7 @@ void processSunReflects() {
     reflectVal = clampU8(reflectVal, state.params[idx].min, state.params[idx].max);
     state.params[idx].value = (uint8_t)reflectVal;
     state.params[idx].baseValue = (uint8_t)reflectVal;
-    sendCC(state.params[idx].cc, state.params[idx].value);
+    sendParamCC(idx);
 
     // Арпеджио: это отражение (уровень level) транспонирует базовую
     // ноту на sunArpSemitones[sunArp]*level полутонов — накопительно
@@ -890,16 +983,29 @@ void processSunReflects() {
     if (state.sunArpActive[idx]) {
       int semitones = (int)sunArpSemitones[state.sunArp] * level;
       int transposed = clampInt((int)state.sunArpBaseNote[idx] + semitones, 0, 127);
-      sendNoteOff(state.sunArpLastNote[idx]);
-      sendNoteOn((uint8_t)transposed, 100);
-      state.sunArpLastNote[idx] = (uint8_t)transposed;
+      releaseSunArpNote(idx);
+      if (sunArpAllowed(idx)) {
+        uint8_t ch = state.params[idx].ch;
+        sendNoteOnCh(ch, (uint8_t)transposed, 100);
+        state.sunArpLastNote[idx] = (uint8_t)transposed;
+        state.sunArpCh[idx] = ch;
+        // В BYPASS нота не ушла — гасить потом нечего.
+        state.sunArpSounding[idx] = (state.bypassMode != BypassMode::BYPASS);
+        if (state.gateMode && state.sunArpSounding[idx]) {
+          // Следующее отражение — через вдвое меньший интервал; нота гаснет на его середине.
+          state.sunArpGatePending[idx] = true;
+          state.sunArpOffAt[idx] = gateOffTime(waveIntervals[state.waveIntervalIndex] >> (level + 1));
+        }
+      }
     }
 
     if (hitClampAgain && level < state.sunRflct) {
       armSunReflect(idx, level + 1);
     } else {
       state.sunReflectLevel[idx] = 0;
-      stopSunArp(idx);
+      // В GATE последняя нота серии доигрывает свой гейт, в LEG снимается сразу, как раньше.
+      if (state.gateMode && state.sunArpGatePending[idx]) state.sunArpActive[idx] = false;
+      else stopSunArp(idx);
     }
   }
 }
@@ -1036,33 +1142,63 @@ void exitGlobalFreeze() {
   }
 }
 
-// Нота секвенсора звучит до следующей ноты (в том числе через пустые шаги): перед новым
-// Note On гасим звучащую — сначала Off, потом On; та же нота перезапускается.
-void seqNoteOn(uint8_t note) {
-  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
-  sendNoteOn(note, 100);
-  // В BYPASS выход заглушён: нота на самом деле не ушла, и гасить её потом не нужно.
-  state.seqSoundingNote = (state.bypassMode == BypassMode::BYPASS) ? -1 : note;
+// Длина шага секвенсора в тактах MIDI Clock (1/16 × SCALE).
+uint32_t seqStepTicks() {
+  return 12 * scaleMultipliers[state.sequencerScaleIndex] / 2;
 }
 
-// Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на канале.
+// Интервал до следующего удара ноты на шаге step: ретриг шага, если он чаще шага, иначе шаг.
+uint32_t seqHitTicks(uint8_t step) {
+  uint32_t t = seqStepTicks();
+  uint8_t r = state.steps[step].retrigIndex;
+  if (r > 0 && r < 5 && retrigIntervals[r] < t) t = retrigIntervals[r];
+  return t;
+}
+
+// Нота секвенсора уходит на все каналы с Seq Trig. В LEG звучит до следующей ноты (в том
+// числе через пустые шаги): перед новым Note On гасим звучащую — сначала Off, потом On;
+// та же нота перезапускается. В GATE гаснет сама на середине hitTicks (см. processGates).
+void seqNoteOn(uint8_t note, uint32_t hitTicks) {
+  if (state.seqSoundingNote >= 0) sendNoteOffMask(state.seqSoundingMask, (uint8_t)state.seqSoundingNote);
+  uint16_t mask = seqChannelMask();
+  sendNoteOnMask(mask, note, 100);
+  // В BYPASS выход заглушён: нота на самом деле не ушла, и гасить её потом не нужно.
+  bool sent = (state.bypassMode != BypassMode::BYPASS) && mask;
+  state.seqSoundingNote = sent ? note : -1;
+  state.seqSoundingMask = sent ? mask : 0;
+  state.seqGatePending = sent && state.gateMode;
+  if (state.seqGatePending) state.seqGateOffAt = gateOffTime(hitTicks);
+}
+
+// Погасить звучащую ноту секвенсора; allNotesOff — ещё и All Notes Off (CC 123) на всех
+// каналах параметров.
 void seqNotesOff(bool allNotesOff) {
-  if (state.seqSoundingNote >= 0) sendNoteOff((uint8_t)state.seqSoundingNote);
+  if (state.seqSoundingNote >= 0) sendNoteOffMask(state.seqSoundingMask, (uint8_t)state.seqSoundingNote);
   state.seqSoundingNote = -1;
-  if (allNotesOff) sendCC(123, 0);
+  state.seqSoundingMask = 0;
+  state.seqGatePending = false;
+  if (allNotesOff) sendCCMask(usedChannelMask(), 123, 0);
+}
+
+// CC-колонка секвенсора уходит туда же, куда его ноты.
+void sendSeqCC(uint8_t val) {
+  sendCCMask(seqChannelMask(), state.sequencerCC, val);
 }
 
 // Погасить всё, что звучит: ноту секвенсора и ноты арпеджио RFLCT (перед тем как выход
-// заглушит BYPASS или сменится канал — иначе ноты повиснут).
+// заглушит BYPASS — иначе ноты повиснут).
 void releaseSoundingNotes() {
   seqNotesOff(false);
   for (uint8_t i = 0; i < NUM_PARAMS; i++) stopSunArp(i);
 }
 
-void setMidiChannel(uint8_t ch) {
-  if (ch == state.midiChannel) return;
-  releaseSoundingNotes();  // Note Off уходит на прежнем канале
-  state.midiChannel = ch;
+// GATE: гасит ноты, у которых подошёл момент Note Off. Задача движка зовёт её каждые 0,5 мс.
+void processGates() {
+  uint32_t now = micros();
+  if (state.seqGatePending && (int32_t)(now - state.seqGateOffAt) >= 0) seqNotesOff(false);
+  for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+    if (state.sunArpGatePending[i] && (int32_t)(now - state.sunArpOffAt[i]) >= 0) releaseSunArpNote(i);
+  }
 }
 
 void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
@@ -1074,13 +1210,13 @@ void triggerSequencerStep(uint8_t stepIndex, bool retrigger = false) {
       else state.triggerTime[p] = now;
       switch (p) {
         case 0:
-          seqNoteOn(state.steps[stepIndex].note);
+          seqNoteOn(state.steps[stepIndex].note, seqHitTicks(stepIndex));
           // Метка тика для проверки строгого совпадения по тику у
           // арпеджиатора RFLCT (см. sunArp / mutateParam).
           state.lastNoteOnTick = state.midiTicks;
           break;
         case 1:
-          sendCC(state.sequencerCC, state.steps[stepIndex].cc);
+          sendSeqCC(state.steps[stepIndex].cc);
           break;
         case 2: {
           uint8_t val = state.steps[stepIndex].wavesIndex;
@@ -1169,8 +1305,7 @@ void onClockTick() {
   // (state.lastNoteOnTick) — иначе проверка "совпадения по тику" для
   // арпеджиатора SUN смотрела бы на события прошлого тика.
   if (state.sequencerRunning) {
-    uint8_t scale = scaleMultipliers[state.sequencerScaleIndex];
-    uint32_t ticksPerStep = 12 * scale / 2;
+    uint32_t ticksPerStep = seqStepTicks();
     // Первый шаг после запуска играет сам шаг 1 (плейхед уже 0) на первом такте после
     // Start, а при запуске под внешний Clock — на ближайшей доле. Доли отсчитываются от
     // Start: первый 0xF8 после него — сильная доля, то есть такты 1, 25, 49…
@@ -1221,8 +1356,8 @@ void onClockTick() {
       uint32_t elapsed = state.midiTicks - state.retrigLastTickGlobal;
       for (uint8_t p = 0; p < 4; p++) {
         if (state.retriggerActive[p] && elapsed >= interval) {
-          if (p == 0) { seqNoteOn(state.lastNote); state.lastNoteOnTick = state.midiTicks; }
-          if (p == 1) sendCC(state.sequencerCC, state.lastCC);
+          if (p == 0) { seqNoteOn(state.lastNote, seqHitTicks(playhead)); state.lastNoteOnTick = state.midiTicks; }
+          if (p == 1) sendSeqCC(state.lastCC);
           if (p == 2) {
             uint8_t val = state.lastWavesIndex;
             switch (state.seqDest) {
@@ -1289,7 +1424,7 @@ void onClockTick() {
       newVal = clampU8(newVal, state.params[i].min, state.params[i].max);
       if (newVal == state.params[i].value) continue;  // CC — только при изменении значения
       state.params[i].value = newVal;
-      sendCC(state.params[i].cc, newVal);
+      sendParamCC(i);
     }
   }
 }
@@ -1335,11 +1470,11 @@ uint8_t midiDataBytesFor(uint8_t status) {
   return 2; // Note On/Off, Poly AT, CC, Pitch Bend
 }
 
-// MIDI Learn: сработавшее входящее CC переназначает CC-номер
-// параметра под курсором. Канал не фильтруем (omni) — контроллер
-// может слать не на том канале, что настроен для исходящих сообщений
-// этого устройства.
-void handleIncomingCC(uint8_t cc, uint8_t val) {
+// MIDI Learn: сработавшее входящее CC переназначает параметру под
+// курсором и номер CC, и канал (ch — 1..16) — покрутил ручку на треке
+// драм-машины, и параметр шлёт ровно туда. Ждём на любом канале (omni).
+// CC секвенсора учит только номер: он уходит на каналы с Seq Trig.
+void handleIncomingCC(uint8_t ch, uint8_t cc, uint8_t val) {
   (void)val;
   if (!state.midiLearnActive) return;
   if (state.midiLearnSequencerCC) {
@@ -1348,6 +1483,7 @@ void handleIncomingCC(uint8_t cc, uint8_t val) {
     uint8_t idx = state.midiLearnParam;
     if (idx >= NUM_PARAMS) { state.midiLearnActive = false; return; }
     state.params[idx].cc = cc;
+    state.params[idx].ch = ch;
     state.needSaveCC = true;
   }
   state.midiLearnActive = false;
@@ -1422,7 +1558,7 @@ void processMIDI() {
       midiParseHaveFirstData = true;
     } else {
       if ((midiRunningStatus & 0xF0) == 0xB0) {
-        handleIncomingCC(midiParsePendingByte & 0x7F, data & 0x7F);
+        handleIncomingCC((midiRunningStatus & 0x0F) + 1, midiParsePendingByte & 0x7F, data & 0x7F);
       }
       midiParseHaveFirstData = false;
     }
@@ -1857,9 +1993,10 @@ void handleEncoderDetent(int mov) {
     mov *= stepSize;
     switch (state.selectedParam) {
       case 0: {
-        int v = (int)state.midiChannel + mov;
-        setMidiChannel(clampU8(v, 1, 16));
-        state.needSaveGlobal = true;
+        if (mov != 0) {
+          state.gateMode = !state.gateMode;  // LEN: LEG <-> GATE
+          state.needSaveGlobal = true;
+        }
         break;
       }
       case 1: {
@@ -1892,8 +2029,10 @@ void handleEncoderDetent(int mov) {
     return;
   }
 
-  // MAIN / CC subpages (MAIN sub 1 – min/max)
-  int step = (tapPressed && !(state.currentPage == Page::MAIN && state.subPageMain == 1)) ? 12 : 1;
+  // MAIN / CC / STORM (основные подстраницы) и MAIN sub 1 – min/max. Крупный шаг ×12 с
+  // TAP — только на STORM: на MAIN и CC TAP+энкодер правит второе значение колонки (номер
+  // CC, Seq Trig), как MAX на CLAMP.
+  int step = (tapPressed && state.currentPage == Page::STORM) ? 12 : 1;
   mov *= step;
 
   if (state.currentPage == Page::MAIN && state.subPageMain == 1) {
@@ -1912,19 +2051,28 @@ void handleEncoderDetent(int mov) {
   // Основные страницы
   switch (state.currentPage) {
     case Page::MAIN: {
-      if (state.frozen[state.selectedParam]) break;
-      int v = state.params[state.selectedParam].value + mov;
-      state.params[state.selectedParam].value = clampU8(v, state.params[state.selectedParam].min, state.params[state.selectedParam].max);
-      state.params[state.selectedParam].baseValue = state.params[state.selectedParam].value;
-      sendCC(state.params[state.selectedParam].cc, state.params[state.selectedParam].value);
+      Param& p = state.params[state.selectedParam];
+      if (tapPressed) {
+        // TAP+энкодер — номер CC параметра (заморозка значения на него не влияет).
+        p.cc = clampU8((int)p.cc + mov, 0, 127);
+        state.needSaveCC = true;
+      } else {
+        if (state.frozen[state.selectedParam]) break;
+        p.value = clampU8((int)p.value + mov, p.min, p.max);
+        p.baseValue = p.value;
+        sendParamCC(state.selectedParam);
+      }
       state.displayDirty = true;
       break;
     }
     case Page::CC: {
       if (state.midiLearnActive) break; // ждём входящий CC — ручное редактирование не мешаем
-      int v = (int)state.params[state.selectedParam].cc + mov;
-      v = clampU8(v, 0, 127);
-      state.params[state.selectedParam].cc = (uint8_t)v;
+      Param& p = state.params[state.selectedParam];
+      if (tapPressed) {
+        if (mov != 0) p.seqTrig = !p.seqTrig;
+      } else {
+        p.ch = clampU8((int)p.ch + mov, CH_NONE, 16);  // 0 = NO
+      }
       state.needSaveCC = true;
       state.displayDirty = true;
       break;
@@ -1964,19 +2112,21 @@ void randomizeCurrentPage() {
         int v = random(state.params[i].min, state.params[i].max + 1);
         state.params[i].value = (uint8_t)v;
         state.params[i].baseValue = (uint8_t)v;
-        sendCC(state.params[i].cc, state.params[i].value);
+        sendParamCC(i);
       }
       state.displayDirty = true;
       break;
     }
     case Page::CC: {
       if (state.subPageCC == 0) {
+        // Каналы 1..16 (без NO — случайно заглушённый параметр выглядел бы поломкой).
         for (uint8_t i = 0; i < NUM_PARAMS; i++) {
-          state.params[i].cc = random(0, 128);
-          state.needSaveCC = true;
+          state.params[i].ch = random(1, 17);
+          state.params[i].seqTrig = random(0, 2);
         }
+        state.needSaveCC = true;
       } else {
-        setMidiChannel(random(1, 17));
+        state.gateMode = random(0, 2);
         state.selectedBypassMode = (random(0, 2) == 0) ? BypassMode::BYPASS : BypassMode::FREEZE;
         state.seqDest = (SeqDest)random(0, 3);
         state.gfxEnabled = random(0, 2);
@@ -2099,10 +2249,14 @@ void resetToDefaults() {
     case Page::CC:
       sub = state.subPageCC;
       if (sub == 0) {
-        for (uint8_t i = 0; i < NUM_PARAMS; i++) state.params[i].cc = i;
+        // Номера CC живут на MAIN (TAP-слой) и здесь не сбрасываются.
+        for (uint8_t i = 0; i < NUM_PARAMS; i++) {
+          state.params[i].ch = 1;
+          state.params[i].seqTrig = true;
+        }
         state.needSaveCC = true;
       } else if (sub == 1) {
-        setMidiChannel(1);
+        state.gateMode = false;
         if (state.bypassMode == BypassMode::FREEZE) exitGlobalFreeze();
         state.bypassMode = BypassMode::OFF;
         state.selectedBypassMode = BypassMode::FREEZE;
@@ -2482,7 +2636,12 @@ void drawWeather(uint32_t time, uint8_t amt, bool bypass=false) {
 }
 
 // ----- Колонки -----
-void drawCCColumn(uint8_t x, uint8_t val, bool selected, uint32_t time, bool bypass) {
+// Значок ноты 5×6 — у канала включён Seq Trig.
+const uint8_t noteIcon[6] = {0b00110, 0b00101, 0b00100, 0b00100, 0b11100, 0b11100};
+
+// Колонка канала на странице CC: номер канала (или NO) по центру, значок ноты в правом
+// верхнем углу, если на этот канал идут ноты секвенсора.
+void drawChannelColumn(uint8_t x, uint8_t ch, bool seqTrig, bool selected, bool bypass) {
   const uint8_t cw=Display::COL_W, my=Display::METER_Y, mh=Display::METER_H;
   uint16_t fg = bypass ? SSD1306_BLACK : SSD1306_WHITE;
   if (g_fillBackground) {
@@ -2492,12 +2651,18 @@ void drawCCColumn(uint8_t x, uint8_t val, bool selected, uint32_t time, bool byp
   if (selected) drawCornerCursor(x, my, cw, mh, fg);
   // Без паддинга — getTextBounds должен мерить реально видимую ширину,
   // иначе центрирование съезжает.
-  char txt[4]; sprintf(txt, "%d", val);
+  char txt[4];
+  if (ch == CH_NONE) strcpy(txt, "NO"); else sprintf(txt, "%u", ch);
   display.setTextSize(1); display.setTextColor(fg);
   int16_t x1,y1; uint16_t w,h;
   display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
   display.setCursor(x + (cw-w)/2, my + (mh-h)/2 + 1);
   display.print(txt);
+  if (seqTrig && ch != CH_NONE) {
+    for (uint8_t r = 0; r < 6; r++)
+      for (uint8_t c = 0; c < 5; c++)
+        if (noteIcon[r] & (0x10 >> c)) display.drawPixel(x + cw - 8 + c, my + 3 + r, fg);
+  }
 }
 
 // isFrozen передаётся явно вызывающим — на STORM индекс колонки не
@@ -2689,7 +2854,7 @@ void drawHeader(Page page, uint8_t sel, bool bypass=false) {
       default:                param = fogSubParams[sel]; break;
     }
   } else if (page == Page::CC && state.subPageCC == 1) {
-    static const char* ccSubParams[4] = {"MIDI CH","BYPASS","SEQ DEST","GFX"};
+    static const char* ccSubParams[4] = {"NOTE LEN","BYPASS","SEQ DEST","GFX"};
     param = ccSubParams[sel];
   } else {
     param = paramNames[idx][sel];
@@ -2738,8 +2903,17 @@ void drawMain(bool bypass) {
   drawHeader(Page::MAIN, state.selectedParam, bypass);
   drawSailboat(64, 0, animTime, amt, bypass);
   if (state.subPageMain == 0) {
-    for (uint8_t i=0; i<NUM_PARAMS; i++)
-      drawColumn(i*32, state.params[i].value, state.selectedParam==i, animTime, amt, bypass, state.frozen[i]);
+    // Пока зажат TAP, энкодер правит номер CC — колонки подписаны номерами, а не значениями.
+    // С задержкой 200 мс: короткие нажатия (двойной TAP — старт/стоп) не мигают подписями.
+    bool showCC = (buttons[1].lastStable == LOW) && (millis() - buttons[1].lastChange > 200);
+    for (uint8_t i=0; i<NUM_PARAMS; i++) {
+      if (showCC) {
+        char txt[6]; sprintf(txt, "CC%u", state.params[i].cc);
+        drawColumnText(i*32, state.params[i].value, txt, state.selectedParam==i, animTime, amt, bypass, state.frozen[i]);
+      } else {
+        drawColumn(i*32, state.params[i].value, state.selectedParam==i, animTime, amt, bypass, state.frozen[i]);
+      }
+    }
   } else {
     for (uint8_t i=0; i<NUM_PARAMS; i++) {
       uint8_t x = i*32;
@@ -2804,11 +2978,11 @@ void drawCC(bool bypass) {
   drawSailboat(64, 0, animTime, amt, bypass);
   if (state.subPageCC == 0) {
     for (uint8_t i=0; i<NUM_PARAMS; i++)
-      drawCCColumn(i*32, state.params[i].cc, state.selectedParam==i, animTime, bypass);
+      drawChannelColumn(i*32, state.params[i].ch, state.params[i].seqTrig, state.selectedParam==i, bypass);
   } else {
-    const char* labels[4] = {"CH", "BYP", "DST", "GFX"};
+    const char* labels[4] = {"LEN", "BYP", "DST", "GFX"};
     char values[4][8];
-    sprintf(values[0], "%d", state.midiChannel);
+    sprintf(values[0], "%s", state.gateMode ? "GATE" : "LEG");
     sprintf(values[1], "%s", (state.selectedBypassMode == BypassMode::FREEZE) ? "FRZ" : "BYP");
     sprintf(values[2], "%s", seqDestNames[(uint8_t)state.seqDest]);
     sprintf(values[3], "%s", state.gfxEnabled ? "ON" : "OFF");
@@ -3440,14 +3614,23 @@ void updateDisplay() {
 // ============================================================
 void loadSettings() {
   storage.begin("redsea", true);
+  // Прежние версии хранили один общий канал "midiCh" — при первой загрузке он становится
+  // каналом всех четырёх параметров, и поведение не меняется.
+  uint8_t legacyCh = storage.getUChar("midiCh", 1);
+  if (legacyCh < 1 || legacyCh > 16) legacyCh = 1;
   for (uint8_t i = 0; i < NUM_PARAMS; i++) {
-    char key[8], keyMin[8], keyMax[8];
+    char key[8], keyMin[8], keyMax[8], keyCh[8], keyTrg[8];
     sprintf(key, "cc%u", i);
     sprintf(keyMin, "min%u", i);
     sprintf(keyMax, "max%u", i);
+    sprintf(keyCh, "ch%u", i);
+    sprintf(keyTrg, "trg%u", i);
     state.params[i].cc = storage.getUChar(key, state.params[i].cc);
     state.params[i].min = storage.getUChar(keyMin, 0);
     state.params[i].max = storage.getUChar(keyMax, 127);
+    state.params[i].ch = storage.getUChar(keyCh, legacyCh);
+    if (state.params[i].ch > 16) state.params[i].ch = legacyCh;
+    state.params[i].seqTrig = storage.getBool(keyTrg, true);
   }
   state.chaos = storage.getUChar("chaos", state.chaos);
   state.waveIntervalIndex = storage.getUChar("waveIdx", 2);
@@ -3484,8 +3667,7 @@ void loadSettings() {
   state.rainSplsh = storage.getUChar("rainSplsh", 0);
   state.rainThunder = storage.getBool("rainThndr", false);
 
-  state.midiChannel = storage.getUChar("midiCh", 1);
-  if (state.midiChannel < 1 || state.midiChannel > 16) state.midiChannel = 1;
+  state.gateMode = storage.getBool("gate", false);
   // Сохраняется/загружается только ВЫБОР режима (BYPASS/FREEZE) —
   // сам bypassMode всегда стартует в OFF, иначе после перезагрузки
   // устройство просыпалось бы в "FROZEN" с баннером на экране, но
@@ -3554,6 +3736,7 @@ void engineLoop(void*) {
     } else {
       lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
     }
+    processGates();
     midiPump();
     uint32_t last = lastInternalTickMicros;
     uint32_t period = internalTickPeriodUs();
@@ -3609,13 +3792,14 @@ uint32_t settingsSignature() {
   uint32_t h = 2166136261u;
   for (uint8_t i = 0; i < NUM_PARAMS; i++) {
     FNV_FIELD(h, state.params[i].cc); FNV_FIELD(h, state.params[i].min); FNV_FIELD(h, state.params[i].max);
+    FNV_FIELD(h, state.params[i].ch); FNV_FIELD(h, state.params[i].seqTrig);
   }
   FNV_FIELD(h, state.chaos); FNV_FIELD(h, state.waveIntervalIndex); FNV_FIELD(h, state.weatherMode);
   FNV_FIELD(h, state.lfoType); FNV_FIELD(h, state.lfoShape); FNV_FIELD(h, state.lfoPhase); FNV_FIELD(h, state.lfoGlide);
   FNV_FIELD(h, state.sunRflct); FNV_FIELD(h, state.sunArp); FNV_FIELD(h, state.sunDflct); FNV_FIELD(h, state.sunBias);
   FNV_FIELD(h, state.snowFlake); FNV_FIELD(h, state.snowRotation); FNV_FIELD(h, state.snowFrz); FNV_FIELD(h, state.snowTime);
   FNV_FIELD(h, state.rainDrip); FNV_FIELD(h, state.rainWet); FNV_FIELD(h, state.rainSplsh); FNV_FIELD(h, state.rainThunder);
-  FNV_FIELD(h, state.midiChannel); FNV_FIELD(h, state.selectedBypassMode); FNV_FIELD(h, state.seqDest);
+  FNV_FIELD(h, state.gateMode); FNV_FIELD(h, state.selectedBypassMode); FNV_FIELD(h, state.seqDest);
   FNV_FIELD(h, state.gfxEnabled);
   return h;
 }
@@ -3794,12 +3978,17 @@ void loop() {
         state.needSaveMinMax = false;
       }
       if (state.needSaveCC) {
-        // Все четыре номера: флаг один на всех, а менять их могут рандомизация, сброс и
-        // MIDI Learn, в том числе не для параметра под курсором. Неизменные NVS не перезаписывает.
+        // Маршрутизация всех четырёх параметров (номер CC, канал, Seq Trig): флаг один на
+        // всех, а менять их могут рандомизация, сброс и MIDI Learn, в том числе не для
+        // параметра под курсором. Неизменные NVS не перезаписывает.
         for (uint8_t i = 0; i < NUM_PARAMS; i++) {
-          char key[8];
+          char key[8], keyCh[8], keyTrg[8];
           sprintf(key, "cc%u", i);
+          sprintf(keyCh, "ch%u", i);
+          sprintf(keyTrg, "trg%u", i);
           storage.putUChar(key, state.params[i].cc);
+          storage.putUChar(keyCh, state.params[i].ch);
+          storage.putBool(keyTrg, state.params[i].seqTrig);
         }
         state.needSaveCC = false;
       }
@@ -3826,7 +4015,7 @@ void loop() {
         state.needSaveStorm = false;
       }
       if (state.needSaveGlobal) {
-        storage.putUChar("midiCh", state.midiChannel);
+        storage.putBool("gate", state.gateMode);
         storage.putUChar("bypassMode", (uint8_t)state.selectedBypassMode);
         storage.putUChar("seqDest", (uint8_t)state.seqDest);
         storage.putBool("gfx", state.gfxEnabled);
