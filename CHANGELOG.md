@@ -15,7 +15,9 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 - **Seq Trig.** A flag per parameter (TAP + turn on the MIDI page, shown as a note icon). Sequencer notes, the sequencer's CC column, SUN arpeggio notes and TWST notes go to every channel with Seq Trig on; repeated channels count once.
 - **Note length — LEN.** `LEG`: a note sounds until the next one, as in 1.0. `GATE`: a note ends halfway to the next hit. Applies to sequencer notes and retriggers, Freeze Roll, SUN arpeggio and TWST.
 - **MIDI Learn learns the channel.** On the MIDI page it takes both the CC number and the channel of the incoming message: turn a knob on a drum machine track, and the parameter sends exactly there.
-- **Freeze Roll.** While FREEZE is held with PLAY, turning the encoder repeats the looped step from 1/4 to 1/128. The window shows a tachometer bar whose length is the rate, the envelope of every hit, a scale and a hit lamp. 1/64 and 1/128 are timed exactly even though they fall between MIDI clock ticks; rates the MIDI line can't carry at the current tempo are dimmed.
+- **Freeze Roll.** While FREEZE is held with PLAY, turning the encoder repeats the looped step from 1/4 to 1/128. The window shows a tachometer bar whose length is the rate, the envelope of every hit, a scale and a hit lamp. 1/64 and 1/128 are timed exactly even though they fall between MIDI clock ticks; rates the MIDI line can't carry at the current tempo are dimmed. Holding the encoder during a roll is a **kill**: the hits go silent while the grid keeps running, and come back exactly on the beat on release.
+
+  ![Freeze Roll kill](docs/screens/roll_kill.png)
 
   ![Freeze Roll at 1/16](docs/screens/roll_16.png)
 

@@ -312,10 +312,14 @@ The lamp blinks with each hit as long as a hit lasts longer than two screen fram
 - Hits are timed against the sequencer's grid: after a rate change, the next hit lands on the nearest division of the new grid. 1/64 and 1/128 are exact even though they fall between MIDI clock ticks.
 - The rate never goes higher than the MIDI line can carry at the current tempo and number of Seq Trig channels; rates out of reach are dimmed on the scale.
 - `EMPTY` in the window means nothing is active on the step.
+- **Kill**: while rolling, hold the encoder down — the hits go silent (the sounding note is cut at once) while the roll keeps running on its grid, so on release the hits come back exactly on the beat. The window shows `KILL`, a crossed-out lamp and a dashed needle; no new teeth come out of the needle, and the gap travels left through the bar. Press and release in rhythm for rhythmic cuts. The roll doesn't time out while kill is held.
 - The roll stops when you release PLAY, after 2 seconds without turning, or when FREEZE turns off. Nothing is saved — the step's retrigger stays as it was.
 - Like the FREEZE loop itself, the roll plays only while the sequencer is running.
 
-The roll is a hold gesture: press PLAY (FREEZE engages), keep holding, turn. If FREEZE is already latched, the next PLAY press turns it off, so press once to exit and then press and hold. While PLAY is held, the encoder doesn't edit parameters, and the PLAY+TAP / TAP+PLAY randomize gestures don't fire after a roll.
+![Freeze Roll kill](docs/screens/roll_kill.png)
+*Kill held: the hits are cut, the gap travels left*
+
+The roll is a hold gesture: press PLAY (FREEZE engages), keep holding, turn. If FREEZE is already latched, the next PLAY press turns it off, so press once to exit and then press and hold. While PLAY is held, the encoder doesn't edit parameters, its button never arms the page reset or counts as a double or triple click, and the PLAY+TAP / TAP+PLAY randomize gestures don't fire after a roll.
 
 ### Entering & exiting
 
@@ -373,6 +377,7 @@ Updating from the first release: the old global MIDI channel is copied to all fo
 | PLAY press                    | Engage/exit BYPASS or FREEZE instantly                      |
 | PLAY hold 0.75s + release     | Exit BYPASS/FREEZE                                          |
 | PLAY hold + encoder turn      | Freeze Roll (in FREEZE)                                     |
+| PLAY hold + encoder hold      | Kill: mute the roll while held                              |
 | PLAY+TAP                      | Randomize current page/parameter                            |
 | TAP+PLAY or TAP+PAGE, hold 3s | Randomize all sequencer steps                               |
 | Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (MIDI) / swing (SCALE, SEQUENCER setup) |

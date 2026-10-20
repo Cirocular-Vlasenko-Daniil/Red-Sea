@@ -108,6 +108,8 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 4; i++) { state.params[i].ch = i + 1; state.params[i].seqTrig = true; }
   rollScene(5, 100011); shot("roll_limit");
   reset(100000); state.currentPage = Page::MAIN; state.sequencerCursor = 1; rollScene(2, 100010); shot("roll_empty");
+  reset(100000); state.currentPage = Page::MAIN; state.sequencerCursor = 6; rollScene(3, 100010, 6);
+  state.rollKill = true; state.rollKillMask = 0x3; shot("roll_kill");
   puts("done");
   return 0;
 }
