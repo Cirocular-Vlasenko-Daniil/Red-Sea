@@ -395,6 +395,15 @@ struct State {
   uint8_t sequencerScaleIndex = 0;
   uint8_t sequencerCC = 00;
   uint16_t sequencerBPM = 120;  // 1..300 — в uint8_t не помещается
+  // Свинг 50..75 %: каждый второй шаг сдвигается позже на (свинг − 50) × 2 % длины шага
+  // (75 % — на полшага). Чётность берётся от счётчика шагов с запуска, а не от номера шага,
+  // чтобы на нечётной длине паттерна два качнутых шага не встали подряд.
+  uint8_t sequencerSwing = 50;
+  uint32_t seqStepCount = 0;
+  bool swingPending = false;   // качнутый шаг ждёт своего момента (micros)
+  uint8_t swingStep = 0;
+  uint32_t swingAt = 0;
+  uint32_t swingHitUs = 0;
   uint8_t sequencerCursor = 0;
   uint8_t sequencerPlayhead = 0;
   // Шаг, который реально триггерится/подсвечивается на этом тике.
@@ -755,6 +764,14 @@ void sendParamCC(uint8_t idx) {
   sendCCCh(state.params[idx].ch, state.params[idx].cc, state.params[idx].value);
 }
 
+// Новое значение параметра от погоды: CC уходит, только если значение изменилось — при
+// AMT 0 или упоре в край погода не забивает линию повторами и не перебивает другие CC.
+void setParamFromWeather(uint8_t idx, uint8_t v) {
+  if (state.params[idx].value == v) return;
+  state.params[idx].value = v;
+  sendParamCC(idx);
+}
+
 // Наборы каналов — маска, бит ch-1. Одинаковые каналы у разных параметров схлопываются.
 inline uint16_t chBit(uint8_t ch) { return (ch >= 1 && ch <= 16) ? (uint16_t)(1u << (ch - 1)) : 0; }
 
@@ -878,9 +895,8 @@ void mutateParam(uint8_t idx) {
       bool dflctTrigger = ((int)random(0, 128) < state.sunDflct);
 
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
-      state.params[idx].value = (uint8_t)newVal;
       state.params[idx].baseValue = (uint8_t)newVal;
-      sendParamCC(idx);
+      setParamFromWeather(idx, (uint8_t)newVal);
 
       // ----- ЛОГИКА RFLCT -----
       // Не шлём повтор мгновенно здесь (внутри одного вызова CC
@@ -921,8 +937,7 @@ void mutateParam(uint8_t idx) {
     case WeatherMode::FOG:
       newVal += random(-amt, amt + 1);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
-      state.params[idx].value = (uint8_t)newVal;
-      sendParamCC(idx);
+      setParamFromWeather(idx, (uint8_t)newVal);
       break;
     case WeatherMode::RAIN: {
       newVal += random(-amt, amt + 1);
@@ -932,8 +947,7 @@ void mutateParam(uint8_t idx) {
       bool hitClamp = (newVal < state.params[idx].min || newVal > state.params[idx].max);
       newVal = (int)(((long)newVal * (127 - state.rainWet) + (long)base * state.rainWet) / 127);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
-      state.params[idx].value = (uint8_t)newVal;
-      sendParamCC(idx);
+      setParamFromWeather(idx, (uint8_t)newVal);
 
       // SPLSH: капля, "приземлившаяся" за CLAMP, может задеть один из
       // соседних параметров небольшим случайным толчком.
@@ -943,8 +957,7 @@ void mutateParam(uint8_t idx) {
           int splashAmt = amt / 2;
           int nv = state.params[neighbor].value + random(-splashAmt, splashAmt + 1);
           nv = clampU8(nv, state.params[neighbor].min, state.params[neighbor].max);
-          state.params[neighbor].value = (uint8_t)nv;
-          sendParamCC(neighbor);
+          setParamFromWeather(neighbor, (uint8_t)nv);
         }
       }
       break;
@@ -955,8 +968,7 @@ void mutateParam(uint8_t idx) {
       // AMT-масштабированный оффсет, как у FOG.
       newVal += random(-amt, amt + 1);
       newVal = clampU8(newVal, state.params[idx].min, state.params[idx].max);
-      state.params[idx].value = (uint8_t)newVal;
-      sendParamCC(idx);
+      setParamFromWeather(idx, (uint8_t)newVal);
       break;
     case WeatherMode::TWST:
       break;  // P1–P4 двигают только удары входящих нот (twstGustImpact)
@@ -975,8 +987,7 @@ void processRainThunder(int amt) {
   uint8_t idx = random(0, NUM_PARAMS);
   if (state.frozen[idx]) return;
   uint8_t extreme = (random(0, 2) == 0) ? state.params[idx].min : state.params[idx].max;
-  state.params[idx].value = extreme;
-  sendParamCC(idx);
+  setParamFromWeather(idx, extreme);
   state.rainStrikeActive = true;
   state.rainStrikeTime = millis();
 }
@@ -1033,9 +1044,8 @@ void processSunReflects() {
     int reflectVal = state.params[idx].value + offset;
     bool hitClampAgain = (reflectVal < state.params[idx].min || reflectVal > state.params[idx].max);
     reflectVal = clampU8(reflectVal, state.params[idx].min, state.params[idx].max);
-    state.params[idx].value = (uint8_t)reflectVal;
     state.params[idx].baseValue = (uint8_t)reflectVal;
-    sendParamCC(idx);
+    setParamFromWeather(idx, (uint8_t)reflectVal);
 
     // Арпеджио: это отражение (уровень level) транспонирует базовую
     // ноту на sunArpSemitones[sunArp]*level полутонов — накопительно
@@ -1478,8 +1488,7 @@ void twstGustImpact() {
   if (twstRand(0, 2)) jump = -jump;
   int v = (int)p.baseValue + jump;
   if (v > p.max || v < p.min) v = (int)p.baseValue - jump;
-  p.value = clampU8(v, p.min, p.max);
-  sendParamCC(idx);
+  setParamFromWeather(idx, clampU8(v, p.min, p.max));
   state.twstGustFrom[idx] = p.value;
   state.twstGustAt[idx] = micros();
   state.twstGustActive[idx] = true;
@@ -1620,6 +1629,39 @@ bool generateInternalTicks() {
   return false;
 }
 
+// Начало шага секвенсора: подсветка, запоминание значений для ретрига и сам шаг.
+// Ровные шаги начинаются прямо на такте, качнутые свингом — позже, из processSwing().
+void startSequencerStep(uint8_t step, uint32_t hitUs) {
+  state.sequencerDisplayStep = step;
+  uint8_t retrigIdx = state.steps[step].retrigIndex;
+  for (uint8_t p = 0; p < 4; p++) {
+    bool active = state.steps[step].active[p];
+    if (active) {
+      if (p == 0) state.lastNote = state.steps[step].note;
+      if (p == 1) state.lastCC = state.steps[step].cc;
+      if (p == 2) state.lastWavesIndex = state.steps[step].wavesIndex;
+      state.retriggerActive[p] = true;
+      state.lastActive[p] = true;
+    } else {
+      if (retrigIdx == 0) state.retriggerActive[p] = false;
+      state.lastActive[p] = false;
+    }
+  }
+  state.stepFlashActive = true;
+  state.stepFlashTime = millis();
+  // Во время Freeze Roll шаг под курсором играет processRoll() по своей сетке.
+  if (!state.rollActive) triggerSequencerStep(step, false, hitUs);
+}
+
+// Отложенный свингом шаг — когда подошло его время. Задача движка зовёт каждые 0,5 мс.
+void processSwing() {
+  if (!state.swingPending) return;
+  if (!state.sequencerRunning) { state.swingPending = false; return; }
+  if ((int32_t)(micros() - state.swingAt) < 0) return;
+  state.swingPending = false;
+  startSequencerStep(state.swingStep, state.swingHitUs);
+}
+
 // Вся логика "на каждый тик" вызывается СТРОГО один раз за реальный
 // тик — либо из processExternalClockTick() (на каждый 0xF8), либо из
 // loop(), когда generateInternalTicks() вернул true.
@@ -1657,6 +1699,11 @@ void onClockTick() {
     bool tick = firstStep || (!state.sequencerStartPending &&
                               state.midiTicks - state.sequencerLastStepTick >= ticksPerStep);
     if (tick) {
+      // Качнутый шаг не успел прозвучать до следующего (темп резко вырос) — играем сейчас.
+      if (state.swingPending) {
+        state.swingPending = false;
+        startSequencerStep(state.swingStep, state.swingHitUs);
+      }
       state.sequencerLastStepTick = state.midiTicks;
       // Реальный плейхед продвигается всегда, независимо от FREEZE —
       // это и даёт бесшовное продолжение после выхода из режима
@@ -1666,25 +1713,22 @@ void onClockTick() {
       // трогая при этом настоящий плейхед выше.
       uint8_t newPlayhead = (state.bypassMode == BypassMode::FREEZE)
         ? state.sequencerCursor : state.sequencerPlayhead;
-      state.sequencerDisplayStep = newPlayhead;
-      uint8_t retrigIdx = state.steps[newPlayhead].retrigIndex;
-      for (uint8_t p = 0; p < 4; p++) {
-        bool active = state.steps[newPlayhead].active[p];
-        if (active) {
-          if (p == 0) state.lastNote = state.steps[newPlayhead].note;
-          if (p == 1) state.lastCC = state.steps[newPlayhead].cc;
-          if (p == 2) state.lastWavesIndex = state.steps[newPlayhead].wavesIndex;
-          state.retriggerActive[p] = true;
-          state.lastActive[p] = true;
-        } else {
-          if (retrigIdx == 0) state.retriggerActive[p] = false;
-          state.lastActive[p] = false;
-        }
+      if (firstStep) state.seqStepCount = 0; else state.seqStepCount++;
+      // Свинг: нечётный по счёту шаг откладывается на сдвиг; GATE считает интервал до
+      // следующего удара с учётом сдвига — перед качнутым шагом он длиннее, после короче.
+      uint32_t stepUs = ticksToUs(ticksPerStep);
+      uint32_t swingUs = (uint32_t)(state.sequencerSwing - 50) * 2 * stepUs / 100;
+      bool swung = (state.seqStepCount & 1) && swingUs > 0;
+      uint32_t hitUs = ticksToUs(seqHitTicks(newPlayhead));
+      if (seqHitTicks(newPlayhead) == ticksPerStep) hitUs = swung ? hitUs - swingUs : hitUs + swingUs;
+      if (swung) {
+        state.swingPending = true;
+        state.swingStep = newPlayhead;
+        state.swingAt = micros() + swingUs;
+        state.swingHitUs = hitUs;
+      } else {
+        startSequencerStep(newPlayhead, hitUs);
       }
-      state.stepFlashActive = true;
-      state.stepFlashTime = millis();
-      // Во время Freeze Roll шаг под курсором играет processRoll() по своей сетке.
-      if (!state.rollActive) triggerSequencerStep(newPlayhead, false);
     }
 
     // Retrigger — тоже относительно отображаемого/триггеримого шага
@@ -2295,6 +2339,12 @@ void handleEncoderDetent(int mov) {
 
   // SEQUENCER setup
   if (state.currentPage == Page::SEQUENCER && state.subPageSequencer == 1) {
+    // TAP+энкодер на SCALE — свинг (второе значение колонки, как MAX на CLAMP).
+    if (tapPressed && state.selectedParam == 3) {
+      state.sequencerSwing = clampU8((int)state.sequencerSwing + mov, 50, 75);
+      state.displayDirty = true;
+      return;
+    }
     int stepSize = tapPressed ? 12 : 1;
     mov *= stepSize;
     switch (state.selectedParam) {
@@ -2557,7 +2607,8 @@ void randomizeCurrentPage() {
       if (state.subPageSequencer == 0) {
         uint8_t i = state.sequencerCursor;
         for (uint8_t p = 0; p < 4; p++) state.steps[i].active[p] = random(0, 2);
-        state.steps[i].note = random(0, 128);
+        // Нота — в пределах ±октавы от текущей, а не любая из 10 октав.
+        state.steps[i].note = clampInt((int)state.steps[i].note + random(-12, 13), 0, 127);
         state.steps[i].cc = random(0, 128);
         switch (state.seqDest) {
           case SeqDest::WAV: state.steps[i].wavesIndex = random(0, 5); break;
@@ -2566,8 +2617,9 @@ void randomizeCurrentPage() {
         }
         state.steps[i].retrigIndex = random(0, 5);
       } else {
-        state.sequencerBPM = random(1, 301);
+        // Темп не трогаем — на живом выступлении случайный BPM ломает всё вокруг.
         state.sequencerSteps = random(1, 17);
+        state.sequencerSwing = random(50, 76);
         state.sequencerCC = random(0, 128);
         state.sequencerScaleIndex = random(0, 4);
         if (state.sequencerCursor >= state.sequencerSteps) state.sequencerCursor = state.sequencerSteps - 1;
@@ -2584,7 +2636,7 @@ void randomizeCurrentPage() {
 void randomizeSequencerAll() {
   for (uint8_t step = 0; step < SEQUENCER_STEPS; step++) {
     for (uint8_t p = 0; p < 4; p++) state.steps[step].active[p] = random(0, 2);
-    state.steps[step].note = random(0, 128);
+    state.steps[step].note = clampInt((int)state.steps[step].note + random(-12, 13), 0, 127);
     state.steps[step].cc = random(0, 128);
     switch (state.seqDest) {
       case SeqDest::WAV: state.steps[step].wavesIndex = random(0, 5); break;
@@ -2730,6 +2782,7 @@ void resetToDefaults() {
       } else if (sub == 1) {
         state.sequencerSteps = 16;
         state.sequencerScaleIndex = 0;
+        state.sequencerSwing = 50;
         state.sequencerCC = 00;
         state.sequencerBPM = 120;
         state.sequencerCursor = 0;
@@ -2767,6 +2820,8 @@ void resetSequencerState() {
   state.sequencerDisplayStep = 0;
   state.sequencerLastStepTick = 0;
   state.sequencerStartPending = false;
+  state.swingPending = false;
+  state.seqStepCount = 0;
   lastInternalTickMicros = 0;
   state.displayDirty = true;
 }
@@ -3461,6 +3516,12 @@ void finishFrame(bool bypass) {
   display.flush();
 }
 
+// TAP держат дольше 200 мс — колонки показывают своё второе значение (номер CC, свинг).
+// Короткие нажатия (двойной TAP — старт/стоп) подписи не переключают.
+bool tapLayerShown() {
+  return buttons[1].lastStable == LOW && millis() - buttons[1].lastChange > 200;
+}
+
 void drawMain(bool bypass) {
   g_fillBackground = false;
   uint16_t bg = bypass ? SSD1306_WHITE : SSD1306_BLACK;
@@ -3473,8 +3534,7 @@ void drawMain(bool bypass) {
   drawSailboat(hx > 64 ? hx : 64, 0, animTime, amt, bypass);
   if (state.subPageMain == 0) {
     // Пока зажат TAP, энкодер правит номер CC — колонки подписаны номерами, а не значениями.
-    // С задержкой 200 мс: короткие нажатия (двойной TAP — старт/стоп) не мигают подписями.
-    bool showCC = (buttons[1].lastStable == LOW) && (millis() - buttons[1].lastChange > 200);
+    bool showCC = tapLayerShown();
     for (uint8_t i=0; i<NUM_PARAMS; i++) {
       if (showCC) {
         char txt[6]; sprintf(txt, "CC%u", state.params[i].cc);
@@ -4084,7 +4144,13 @@ void drawSequencerSetup(bool bypass) {
   else sprintf(values[0], "%d", state.sequencerBPM);
   sprintf(values[1], "%d", state.sequencerSteps);
   sprintf(values[2], "%d", state.sequencerCC);
-  sprintf(values[3], "%s", scaleNames[state.sequencerScaleIndex]);
+  // Пока зажат TAP — свинг; иначе SCALE, с «~», если свинг включён.
+  if (tapLayerShown()) {
+    labels[3] = "SWING";
+    sprintf(values[3], "%u%%", state.sequencerSwing);
+  } else {
+    sprintf(values[3], "%s%s", scaleNames[state.sequencerScaleIndex], state.sequencerSwing > 50 ? "~" : "");
+  }
   for (uint8_t i=0; i<4; i++) {
     uint8_t x = i*32;
     display.fillRect(x, setupY, Display::COL_W, setupH, bg);
@@ -4310,6 +4376,8 @@ void loadSettings() {
   state.sequencerCC = storage.getUChar("seqCC", 20);
   state.sequencerScaleIndex = storage.getUChar("seqScale", 0);
   if (state.sequencerScaleIndex > 3) state.sequencerScaleIndex = 0;
+  state.sequencerSwing = storage.getUChar("seqSwing", 50);
+  if (state.sequencerSwing < 50 || state.sequencerSwing > 75) state.sequencerSwing = 50;
   size_t stepsSize = storage.getBytesLength("steps");
   if (stepsSize == sizeof(state.steps)) {
     storage.getBytes("steps", state.steps, sizeof(state.steps));
@@ -4324,6 +4392,7 @@ void saveSequencerSettings() {
   storage.putUShort("seqBPM16", state.sequencerBPM);
   storage.putUChar("seqCC", state.sequencerCC);
   storage.putUChar("seqScale", state.sequencerScaleIndex);
+  storage.putUChar("seqSwing", state.sequencerSwing);
   storage.putBytes("steps", state.steps, sizeof(state.steps));
   storage.end();
 }
@@ -4359,6 +4428,7 @@ void engineLoop(void*) {
       lastInternalTickMicros = 0;  // когда внешний Clock пропадёт — начать с нуля, без «догоняния»
     }
     processRoll();
+    processSwing();
     processTwst();
     processGates();
     midiPump();
@@ -4409,6 +4479,7 @@ uint32_t sequencerSignature() {
   h = fnvAdd(h, state.steps, sizeof(state.steps));
   FNV_FIELD(h, state.sequencerSteps); FNV_FIELD(h, state.sequencerBPM);
   FNV_FIELD(h, state.sequencerCC); FNV_FIELD(h, state.sequencerScaleIndex);
+  FNV_FIELD(h, state.sequencerSwing);
   return h;
 }
 
