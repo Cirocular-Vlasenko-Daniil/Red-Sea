@@ -46,7 +46,7 @@ Holding **TAP** while pressing another button changes what that button does almo
 ### TAP
 
 - **Double-click**: start/stop the sequencer.
-- **Hold while turning the encoder**: coarser step size on STORM and SEQUENCER. On MAIN it edits the parameter's CC number, on the MAIN subpage — **max**, on MIDI — **Seq Trig**.
+- **Hold while turning the encoder**: coarser step size on STORM and SEQUENCER. On MAIN it edits the parameter's CC number, on the MAIN subpage — **max**, on MIDI — **Seq Trig**, on the SCALE column of the SEQUENCER setup — **swing**.
 - **Hold while pressing PAGE**: cycles the *subpage* instead of the page; held for 3s together with PAGE, randomizes all sequencer steps (same as TAP+PLAY above).
 
 ### PAGE
@@ -154,7 +154,7 @@ A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-s
   - **BPM** — internal tempo, used when no external MIDI clock is present. Shows the detected tempo instead (read-only) whenever an external clock is running.
   - **STEPS** — pattern length, 1–16.
   - **CC** — which CC number the sequencer's CC column sends. Triple-click **[ENC_SW]** here to MIDI Learn it.
-  - **SCALE** — playback speed multiplier (1, 1/2, 1/4, 1/8).
+  - **SCALE** — playback speed multiplier (1, 1/2, 1/4, 1/8). **[TAP]**+turn sets **swing**, 50–75 %: every second step is pushed later by (swing − 50) × 2 % of a step, so 75 % delays it by half a step. While TAP is held, the column shows `SWING` and the amount; otherwise a `~` after the SCALE value means swing is on. Swing follows the step length (at SCALE 1/2 the eighths swing) and also shapes the FREEZE loop; Freeze Roll stays straight.
 
 ![SEQUENCER step view](docs/screens/seq_steps.png)
 *Step view: cursor on step 5, playhead on step 7*
@@ -162,13 +162,16 @@ A 16-step sequencer that can drive a note, a CC, one of WAV/AMT/WTH, and a per-s
 ![SEQUENCER setup](docs/screens/seq_setup.png)
 *Setup subpage*
 
-**Randomizing:** **[PLAY+TAP]** randomizes just the step under the cursor. Holding **[TAP+PLAY]** together for 3 seconds randomizes every step in the pattern — trigs and activations both — with the screen border blinking as a warning before it fires.
+![SEQUENCER setup with TAP held](docs/screens/seq_setup_swing.png)
+*TAP held: SCALE shows the swing*
+
+**Randomizing:** **[PLAY+TAP]** randomizes just the step under the cursor; its note lands within an octave of the current one. Holding **[TAP+PLAY]** together for 3 seconds randomizes every step in the pattern — trigs and activations both — with the screen border blinking as a warning before it fires. On the setup subpage, **[PLAY+TAP]** randomizes STEPS, CC, SCALE and swing but leaves the tempo alone.
 
 ---
 
 ## 7. The five weather engines
 
-Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STORM subpage parameters give each one a distinct personality. TWST is the exception: it reacts to incoming notes instead of the clock grid.
+Each engine mutates P1–P4 on the `WAV` timing grid, scaled by `AMT`. Their STORM subpage parameters give each one a distinct personality. TWST is the exception: it reacts to incoming notes instead of the clock grid. Every engine sends a parameter's CC only when its value changes — with AMT at 0 the CCs stay silent.
 
 ### FOG — continuous LFO
 
@@ -372,4 +375,4 @@ Updating from the first release: the old global MIDI channel is copied to all fo
 | PLAY hold + encoder turn      | Freeze Roll (in FREEZE)                                     |
 | PLAY+TAP                      | Randomize current page/parameter                            |
 | TAP+PLAY or TAP+PAGE, hold 3s | Randomize all sequencer steps                               |
-| Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (MIDI) |
+| Encoder turn (TAP held)       | Coarse step (STORM, SEQUENCER) / CC number (MAIN) / max (MAIN subpage) / Seq Trig (MIDI) / swing (SCALE, SEQUENCER setup) |

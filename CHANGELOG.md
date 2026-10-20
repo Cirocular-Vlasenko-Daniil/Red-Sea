@@ -19,6 +19,10 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 
   ![Freeze Roll at 1/16](docs/screens/roll_16.png)
 
+- **Swing.** TAP + turn on the SCALE column of the sequencer setup: 50–75 %, every second step is pushed later, up to half a step. Timed precisely rather than to clock ticks; GATE follows the swung intervals.
+
+  ![SEQUENCER setup with swing](docs/screens/seq_setup_swing.png)
+
 - **TWST** — a fifth weather engine driven by the MIDI input. Every incoming note plays immediately and scatters into copies (DEBR) across a window (SCAT) and a pitch set (RADS); each impact knocks one of P1–P4 away from its base value, which then glides back (GUST). Works with the sequencer stopped.
 
   ![TWST subpage](docs/screens/storm_twst.png)
@@ -34,6 +38,8 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 - **Sequencer step cursor**: hold the encoder and turn (right — forward). The old gesture, holding the encoder and pressing TAP, is removed — it let the 3-second page reset fire.
 - Turning the encoder while it's held cancels the 3-second reset, on every page.
 - While PLAY is held, the encoder never edits parameters.
+- SUN, RAIN and SNOW send a parameter's CC only when its value changes (FOG already did). With AMT at 0 the weather stays silent and no longer overwrites other CCs every WAV step.
+- Randomizing a sequencer step puts its note within an octave of the current note, instead of anywhere in 0–127. Randomizing the sequencer setup no longer touches the tempo.
 - MAIN subpage (min/max): the value being edited is underlined — min, or max while TAP is held.
 
   ![MAIN subpage with TAP held](docs/screens/main_clamp_max.png)

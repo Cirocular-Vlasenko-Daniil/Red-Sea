@@ -96,7 +96,9 @@ int main(int argc, char** argv) {
   }
   // SEQUENCER
   reset(100000); state.currentPage = Page::SEQUENCER; state.selectedParam = 0; shot("seq_steps");
-  reset(100000); state.currentPage = Page::SEQUENCER; state.subPageSequencer = 1; state.selectedParam = 0; shot("seq_setup");
+  reset(100000); state.currentPage = Page::SEQUENCER; state.subPageSequencer = 1; state.selectedParam = 0; state.sequencerSwing = 62; shot("seq_setup");
+  reset(100000); state.currentPage = Page::SEQUENCER; state.subPageSequencer = 1; state.selectedParam = 3; state.sequencerSwing = 62;
+  buttons[1].lastStable = LOW; shot("seq_setup_swing");
   // FREEZE и Freeze Roll
   reset(100000); state.currentPage = Page::MAIN; freeze(); shot("frozen");
   reset(100000); state.currentPage = Page::MAIN; state.sequencerCursor = 6; rollScene(2, 100010, 6); shot("roll_16");
