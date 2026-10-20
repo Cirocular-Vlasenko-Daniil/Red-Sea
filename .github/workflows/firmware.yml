@@ -1,0 +1,78 @@
+# Copy to .github/workflows/ of your firmware repository, next to espidi.json (see the template).
+# On every push: makes cover.h from the cover, builds the sketch named in espidi.json and checks
+# the result against ESPidi HUB. When the version in ESPIDI_FIRMWARE() (or the cover) changes, it
+# commits the build to the "firmware" path of espidi.json — that is what the ESPidi composer site
+# loads when someone pastes your repository. On a v* tag it also attaches the .bin to the release.
+name: firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-${{ github.ref }}
+
+env:
+  ARDUINO_ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ESPidi HUB SDK and tools
+        uses: actions/checkout@v4
+        with:
+          repository: Cirocular-Vlasenko-Daniil/ESPidi-HUB
+          path: .espidi-hub
+
+      - name: Read espidi.json, make cover.h
+        run: |
+          echo "SKETCH=$(python3 -c 'import json; print(json.load(open("espidi.json"))["sketch"])')" >> "$GITHUB_ENV"
+          python3 .espidi-hub/tools/espidi_hub.py repo . --sync-cover
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: ESP32 core and libraries
+        run: |
+          arduino-cli core update-index --additional-urls "$ARDUINO_ESP32_URL"
+          arduino-cli core install esp32:esp32 --additional-urls "$ARDUINO_ESP32_URL"
+          arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library"
+
+      # huge_app only lifts Arduino's own 1.25 MB limit; the real limit is the HUB slot.
+      - name: Build
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --warnings all \
+            --library .espidi-hub/sdk/ESPidiHub --output-dir out "$SKETCH"
+
+      - name: Check against ESPidi HUB
+        run: python3 .espidi-hub/tools/espidi_hub.py repo . --build "out/$SKETCH.ino.bin"
+
+      # Commits made with the workflow token don't start this workflow again.
+      - name: Publish a new version for the composer
+        if: github.event_name != 'pull_request' && github.ref_type == 'branch'
+        run: |
+          python3 .espidi-hub/tools/espidi_hub.py repo . --build "out/$SKETCH.ino.bin" --publish
+          FIRMWARE=$(python3 -c 'import json; print(json.load(open("espidi.json"))["firmware"])')
+          git add "$FIRMWARE"
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Publish $SKETCH build for ESPidi HUB"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SKETCH }}
+          path: out/${{ env.SKETCH }}.ino.bin
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/${{ env.SKETCH }}.ino.bin

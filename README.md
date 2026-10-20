@@ -44,12 +44,14 @@ See [MANUAL.md](MANUAL.md) for the full pin-out, control gestures, and a page-by
 
 ## Building & flashing
 
-The firmware is a single Arduino sketch, `REDSEA.ino`, written for the Arduino core on ESP32. Build it with the Arduino IDE (board: ESP32C3 Dev Module) or `arduino-cli`. Dependencies: `Adafruit_GFX`, `Adafruit_SSD1306`, `Preferences` (bundled with the ESP32 core).
+The firmware is a single Arduino sketch, `REDSEA/REDSEA.ino`, written for the Arduino core on ESP32. Build it with the Arduino IDE (board: ESP32C3 Dev Module) or `arduino-cli`. Dependencies: `Adafruit_GFX`, `Adafruit_SSD1306`, `Preferences` (bundled with the ESP32 core) and the header-only [ESPidi HUB SDK](https://github.com/Cirocular-Vlasenko-Daniil/ESPidi-HUB/tree/main/sdk/ESPidiHub) — put the `ESPidiHub` folder into your Arduino `libraries`.
 
 ```bash
-# arduino-cli, from a folder named REDSEA that contains REDSEA.ino
-arduino-cli compile --fqbn esp32:esp32:esp32c3 REDSEA
+# arduino-cli, from the repository root
+arduino-cli compile --fqbn esp32:esp32:esp32c3 --library <ESPidi-HUB>/sdk/ESPidiHub REDSEA
 ```
+
+**ESPidi HUB.** RED SEA can share an ESPidi with a second firmware: [install it into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). On every push the `firmware` workflow builds the sketch; when the version in `ESPIDI_FIRMWARE()` changes, it commits the build to `espidi/REDSEA.ino.bin`, which the HUB composer site loads. The HUB start screen shows `cover.png`; `REDSEA/cover.h` is generated from it.
 
 Wiring reference (see `Pins::` in the source for the authoritative list):
 

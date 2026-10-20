@@ -7,7 +7,7 @@
 uint32_t g_ms = 100000, g_us = 100000000u, g_rnd = 12345;
 int g_pins[64];
 TwoWire Wire;
-#include "../../REDSEA.ino"
+#include "../../REDSEA/REDSEA.ino"
 
 static uint8_t baseState[sizeof(State)];
 static void setTime(uint32_t ms) { g_ms = ms; g_us = ms * 1000u; }

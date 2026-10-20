@@ -3,6 +3,11 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Preferences.h>
+#include <ESPidiHub.h>
+
+// Имя и версия для ESPidi HUB. Смена версии = новая сборка для сайта (workflow, espidi.json).
+ESPIDI_FIRMWARE("redsea", "RED SEA", "1.1 beta", "Daniil Vlasenko");
+#include "cover.h"  // из cover.png: python3 <ESPidi-HUB>/tools/espidi_hub.py repo . --sync-cover
 
 // ============================================================
 // 1. КОНФИГУРАЦИЯ

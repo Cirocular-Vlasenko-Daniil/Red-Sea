@@ -29,6 +29,8 @@
 
   ![Подстраница TWST](docs/screens/storm_twst.png)
 
+- **ESPidi HUB.** Репозиторий готов для ESPidi HUB: `espidi.json`, обложка для экрана запуска HUB, `ESPIDI_FIRMWARE()` в скетче и workflow, который публикует сборку, — [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). Скетч переехал в `REDSEA/REDSEA.ino`.
+
 ### Изменено
 
 - Страница CC теперь называется **MIDI**.
@@ -76,7 +78,7 @@
 
 - Русские README и мануал, лицензия на документацию `LICENSE-DOCS` (CC BY 4.0).
 - Скриншоты отрисованы собственным кодом отрисовки прошивки; `tools/screens/render.sh` пересобирает их.
-- Инструкция по сборке: прошивка — скетч `REDSEA.ino`, собирается в Arduino IDE или через `arduino-cli`.
+- Инструкция по сборке: прошивка — скетч `REDSEA/REDSEA.ino` (нужен SDK ESPidi HUB), собирается в Arduino IDE или через `arduino-cli`.
 
 ### Обновление с 1.0
 

@@ -44,12 +44,14 @@
 
 ## Сборка и прошивка
 
-Прошивка — единый Arduino-скетч `REDSEA.ino`, написанный под Arduino core для ESP32. Собирается в Arduino IDE (плата: ESP32C3 Dev Module) или через `arduino-cli`. Зависимости: `Adafruit_GFX`, `Adafruit_SSD1306`, `Preferences` (идёт в комплекте с ESP32 core).
+Прошивка — единый Arduino-скетч `REDSEA/REDSEA.ino`, написанный под Arduino core для ESP32. Собирается в Arduino IDE (плата: ESP32C3 Dev Module) или через `arduino-cli`. Зависимости: `Adafruit_GFX`, `Adafruit_SSD1306`, `Preferences` (идёт в комплекте с ESP32 core) и [SDK ESPidi HUB](https://github.com/Cirocular-Vlasenko-Daniil/ESPidi-HUB/tree/main/sdk/ESPidiHub) из одного заголовка — папку `ESPidiHub` положите в `libraries` Arduino.
 
 ```bash
-# arduino-cli, из папки REDSEA, в которой лежит REDSEA.ino
-arduino-cli compile --fqbn esp32:esp32:esp32c3 REDSEA
+# arduino-cli, из корня репозитория
+arduino-cli compile --fqbn esp32:esp32:esp32c3 --library <ESPidi-HUB>/sdk/ESPidiHub REDSEA
 ```
+
+**ESPidi HUB.** RED SEA может жить на одной ESPidi со второй прошивкой: [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). Workflow `firmware` собирает скетч при каждом push, а когда меняется версия в `ESPIDI_FIRMWARE()`, коммитит сборку в `espidi/REDSEA.ino.bin` — её и загружает сайт-сборщик HUB. На экране запуска HUB показывает `cover.png`; `REDSEA/cover.h` генерируется из него.
 
 Распиновка (авторитетный источник — `Pins::` в исходнике):
 

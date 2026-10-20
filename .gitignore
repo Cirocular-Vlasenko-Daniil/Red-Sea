@@ -1,0 +1,4 @@
+# Arduino IDE / arduino-cli
+build/
+
+.DS_Store

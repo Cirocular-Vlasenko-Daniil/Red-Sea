@@ -29,6 +29,8 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 
   ![TWST subpage](docs/screens/storm_twst.png)
 
+- **ESPidi HUB.** The repository is ESPidi-ready: `espidi.json`, a cover for the HUB start screen, `ESPIDI_FIRMWARE()` in the sketch and a workflow that publishes the build — [install into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). The sketch moved to `REDSEA/REDSEA.ino`.
+
 ### Changed
 
 - The CC page is now called **MIDI**.
@@ -76,7 +78,7 @@ Already in `main`.
 
 - Russian README and manual, documentation license `LICENSE-DOCS` (CC BY 4.0).
 - Screenshots rendered from the firmware's own drawing code; `tools/screens/render.sh` rebuilds them.
-- Build instructions: the firmware is the `REDSEA.ino` sketch, built with the Arduino IDE or `arduino-cli`.
+- Build instructions: the firmware is the `REDSEA/REDSEA.ino` sketch, built with the Arduino IDE or `arduino-cli` (needs the ESPidi HUB SDK).
 
 ### Updating from 1.0
 
