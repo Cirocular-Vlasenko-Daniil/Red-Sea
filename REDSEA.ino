@@ -527,6 +527,11 @@ struct State {
   bool rollUsedThisHold = false;   // за это удержание PLAY крутили ролл — не рандомизировать
   uint16_t rollQLast = 0;          // интервал, по которому отсчитан rollLastSlot
   uint32_t rollLastSlot = 0;
+  // Kill: пока во время ролла зажат энкодер, удары молчат, а сетка идёт дальше.
+  // rollKillMask — какие из последних 64 ударов прошли заглушёнными (бит 0 — текущий);
+  // по нему окно рисует «дыру» в огибающих.
+  bool rollKill = false;
+  uint64_t rollKillMask = 0;
 
   // Кнопки
   bool playWasPressed = false;
@@ -1383,8 +1388,24 @@ void rollTurn(int mov) {
 }
 
 void stopRoll() {
+  state.rollKill = false;
   if (!state.rollActive) return;
   state.rollActive = false;
+  state.displayDirty = true;
+}
+
+// Kill: зажали энкодер во время ролла — звучащая нота гаснет сразу, дальше удары молчат.
+void startRollKill() {
+  state.rollKill = true;
+  state.rollUsedThisHold = true;
+  seqNotesOff(false);
+  state.displayDirty = true;
+}
+
+void stopRollKill() {
+  if (!state.rollKill) return;
+  state.rollKill = false;
+  state.rollLastTurnMs = millis();   // 2 с до сброса ролла — от отпускания
   state.displayDirty = true;
 }
 
@@ -1397,9 +1418,15 @@ void processRoll() {
   if (!state.sequencerRunning || state.sequencerStartPending) return;
   uint16_t q = rollQ[rollEffectiveIndex()];
   uint32_t slot = rollPosQ() / q;
-  if (q != state.rollQLast) { state.rollQLast = q; state.rollLastSlot = slot; return; }
+  if (q != state.rollQLast) { state.rollQLast = q; state.rollLastSlot = slot; state.rollKillMask = 0; return; }
   if (slot == state.rollLastSlot) return;
+  uint32_t ds = slot - state.rollLastSlot;
   state.rollLastSlot = slot;
+  state.rollKillMask = (ds >= 64) ? 0 : state.rollKillMask << ds;
+  if (state.rollKill) {
+    state.rollKillMask |= (ds >= 64) ? ~0ULL : (1ULL << ds) - 1;
+    return;
+  }
   triggerSequencerStep(state.sequencerCursor, true, (uint32_t)q * tickPeriodUs() / 4);
 }
 
@@ -2007,6 +2034,7 @@ void updateButtons() {
         }
         else if (i == 3) {
           if (prev == LOW && b.lastStable == HIGH) {
+            stopRollKill();
             if (state.encLongPressActive) {
               state.encLongPressActive = false;
               state.encLongPressFrameVisible = false;
@@ -2062,6 +2090,9 @@ void updateButtons() {
           state.playWasPressed = true;
           state.playPressTime = millis();
           state.rollUsedThisHold = false;
+          // Энкодер зажали до PLAY — дальше он работает на ролл, сброс страницы не нужен.
+          state.encLongPressActive = false;
+          state.encLongPressFrameVisible = false;
           // Перфоманс-функционал: вход в BYPASS/FREEZE происходит
           // сразу по нажатию, а не по отпусканию — чтобы моментально
           // "давить" эффект вживую. Если режим уже включён (залип с
@@ -2114,6 +2145,14 @@ void updateButtons() {
         }
         else if (i == 3) {
           uint32_t now = millis();
+
+          // Пока зажат PLAY, энкодер принадлежит Freeze Roll: нажатие во время ролла —
+          // kill, без ролла — ничего (ни сброса по удержанию, ни двойного/тройного клика).
+          if (buttons[0].lastStable == LOW) {
+            if (state.rollActive && state.bypassMode == BypassMode::FREEZE) startRollKill();
+            b.processed = true;
+            continue;
+          }
 
           // Пока MIDI Learn ждёт данных — любое нажатие ENC_SW просто
           // отменяет ожидание, не запуская обычную double/triple-click
@@ -3382,7 +3421,7 @@ uint8_t drawHeader(Page page, uint8_t sel, bool bypass=false) {
 // шахматка, инвертирующаяся каждый кадр (самое быстрое мерцание, какое может экран).
 // Пороги — от реального времени между кадрами, а не от заданной частоты обновления.
 void drawRollLamp(uint8_t x, uint8_t y, uint16_t fg, uint32_t hitUs, uint8_t phase,
-                  uint32_t hitNo, bool playing) {
+                  uint32_t hitNo, bool playing, bool killed) {
   static uint32_t lastFrameUs = 0;
   static uint8_t flip = 0;
   uint32_t now = micros();
@@ -3392,6 +3431,11 @@ void drawRollLamp(uint8_t x, uint8_t y, uint16_t fg, uint32_t hitUs, uint8_t pha
   if (frameUs > 60000) frameUs = 60000;
   flip ^= 1;
   display.drawRect(x, y, 7, 7, fg);
+  if (killed) {   // kill: лампа перечёркнута, ударов нет
+    display.drawLine(x + 1, y + 1, x + 5, y + 5, fg);
+    display.drawLine(x + 5, y + 1, x + 1, y + 5, fg);
+    return;
+  }
   if (!playing || hitUs == 0) return;
   uint32_t perFrame10 = frameUs * 10 / hitUs;   // ударов за кадр × 10
   for (uint8_t dy = 0; dy < 5; dy++) {
@@ -3461,27 +3505,48 @@ void drawRollOverlay(bool bypass) {
   uint32_t total = ticks * 1024 + sub;
   uint32_t base = (ticks % 24) * 1024 + sub;
 
+  bool killed = state.rollKill;
   drawRollLamp(lampX, by + 2, fg, (uint32_t)q * period / 4, (base % qU) * 256 / qU,
-               rollPosQ() / q, playing);
-  display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
-  display.setCursor(bx + bw - 4 - w, by + 2);
-  display.print(rollNames[eff]);
+               rollPosQ() / q, playing, killed);
+  if (killed) {
+    // KILL вместо размера — инвертированной плашкой.
+    display.getTextBounds("KILL", 0, 0, &x1, &y1, &w, &h);
+    int16_t kx = bx + bw - 4 - w;
+    display.fillRect(kx - 2, by + 1, w + 3, 9, fg);
+    display.setTextColor(bg);
+    display.setCursor(kx, by + 2);
+    display.print("KILL");
+    display.setTextColor(fg);
+  } else {
+    display.getTextBounds(rollNames[eff], 0, 0, &x1, &y1, &w, &h);
+    display.setCursor(bx + bw - 4 - w, by + 2);
+    display.print(rollNames[eff]);
+  }
 
   const int16_t barX = bx + 5, barW = 112, top = by + 10, A = 7, bot = top + A - 1;
   auto levelX = [&](float l) -> int16_t { return barX + (int16_t)((l + 0.5f) * barW / 6.0f + 0.5f); };
   for (int16_t x = barX; x < barX + barW; x += 2) display.drawPixel(x, bot + 1, fg);
   int16_t fx = levelX(lvl);
   if (playing) {
+    uint32_t curSlot = total / qU;
     for (int16_t x = barX; x <= fx; x++) {
       uint32_t off = (uint32_t)(fx - x) * BEAT_U / barW;
       if (ticks < 24 && total < off) continue;   // в первой доле: до первого шага ударов не было
+      // Kill: удар этого места прошёл заглушённым — вместо зубца тишина. Текущий удар
+      // глушится сразу при нажатии, а «дыра» потом уезжает влево вместе с огибающими.
+      uint32_t d = curSlot - (total - off) / qU;
+      if ((d == 0 && killed) || (d < 64 && ((state.rollKillMask >> d) & 1))) continue;
       uint32_t l = ((base + BEAT_U - off) % qU) * 256 / qU;   // 0..255 внутри удара
       uint32_t e = state.gateMode ? (l < 128 ? 255 - 2 * l : 0) : 255 - l;
       uint8_t hgt = (e * A + 127) / 255;
       if (hgt) display.drawFastVLine(x, bot - hgt + 1, hgt, fg);
     }
   }
-  display.drawFastVLine(fx + 1, top - 1, A + 2, fg);
+  if (killed) {
+    for (int16_t yy = top - 1; yy <= bot + 1; yy += 2) display.drawPixel(fx + 1, yy, fg);
+  } else {
+    display.drawFastVLine(fx + 1, top - 1, A + 2, fg);
+  }
 
   // Шкала: подписи по центру своих ступеней, справа налево без наложений.
   int16_t lx[ROLL_STEPS];
@@ -4548,7 +4613,7 @@ void loop() {
   checkTapPlayLongPress();
 
   // Freeze Roll: 2 с без вращения — частота возвращается к обычной.
-  if (state.rollActive && millis() - state.rollLastTurnMs >= 2000) stopRoll();
+  if (state.rollActive && !state.rollKill && millis() - state.rollLastTurnMs >= 2000) stopRoll();
 
   static uint32_t lastAnimTime = 0;
   // Пока открыто окно Freeze Roll — 40 кадров/с вместо 20, чтобы бежали огибающие и мигала лампа.
