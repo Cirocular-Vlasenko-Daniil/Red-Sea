@@ -53,6 +53,7 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 
 ### Fixed
 
+- Under ESPidi HUB settings could be lost on some boards: the build is now made in DIO flash mode (1.1 beta 2).
 - SUN arpeggio: a new echo series could leave the previous arpeggio note hanging.
 - MAIN subpage: the edit marker was drawn in the fill color of the selected column — invisible, and it erased parts of the digits.
 - Long headers (`NOTE LEN`, `SEQ DEST`, `RFLCT`, `ROTATE`, `DEBRIS`) were partly covered by the sailboat.

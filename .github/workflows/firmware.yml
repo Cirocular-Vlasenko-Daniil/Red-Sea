@@ -45,9 +45,10 @@ jobs:
           arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library"
 
       # huge_app only lifts Arduino's own 1.25 MB limit; the real limit is the HUB slot.
+      # FlashMode=dio: the HUB bootloader runs the flash in DIO, a QIO build reads its own flash as garbage.
       - name: Build
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app --warnings all \
+          arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=huge_app,FlashMode=dio --warnings all \
             --library .espidi-hub/sdk/ESPidiHub --output-dir out "$SKETCH"
 
       - name: Check against ESPidi HUB
