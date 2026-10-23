@@ -51,7 +51,7 @@
 arduino-cli compile --fqbn esp32:esp32:esp32c3 --library <ESPidi-HUB>/sdk/ESPidiHub REDSEA
 ```
 
-**ESPidi HUB.** RED SEA может жить на одной ESPidi со второй прошивкой: [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). Workflow `firmware` собирает скетч при каждом push, а когда меняется версия в `ESPIDI_FIRMWARE()`, коммитит сборку в `espidi/REDSEA.ino.bin` — её и загружает сайт-сборщик HUB. На экране запуска HUB показывает `cover.png`; `REDSEA/cover.h` генерируется из него.
+**ESPidi HUB.** RED SEA может жить на одной ESPidi со второй прошивкой: [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea). Workflow `firmware` собирает скетч при каждом push, а когда меняется версия в `ESPIDI_FIRMWARE()`, коммитит сборку в `espidi/REDSEA.ino.bin` — её и загружает сайт-сборщик HUB. На экране запуска HUB показывает `cover.png`; `REDSEA/cover.h` генерируется из него.
 
 Распиновка (авторитетный источник — `Pins::` в исходнике):
 
@@ -67,7 +67,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32c3 --library <ESPidi-HUB>/sdk/ESPidi
 
 ## Статус
 
-`main` — первая стабильная версия. `beta` — MIDI-каналы на каждый параметр, длина нот, Freeze Roll и движок TWST; в тестировании. Что изменилось с 1.0: [CHANGELOG.ru.md](CHANGELOG.ru.md). Issue и pull request приветствуются.
+Текущая версия — 1.1: MIDI-каналы на каждый параметр, длина нот, Freeze Roll, свинг и движок TWST. Что изменилось с 1.0: [CHANGELOG.ru.md](CHANGELOG.ru.md). Issue и pull request приветствуются.
 
 Обновление с первой версии: при первом включении прежний общий MIDI-канал копируется во все четыре параметра, так что устройство работает как раньше, пока вы сами не поменяете маршрутизацию.
 

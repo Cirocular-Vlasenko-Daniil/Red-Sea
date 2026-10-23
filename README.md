@@ -51,7 +51,7 @@ The firmware is a single Arduino sketch, `REDSEA/REDSEA.ino`, written for the Ar
 arduino-cli compile --fqbn esp32:esp32:esp32c3 --library <ESPidi-HUB>/sdk/ESPidiHub REDSEA
 ```
 
-**ESPidi HUB.** RED SEA can share an ESPidi with a second firmware: [install it into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). On every push the `firmware` workflow builds the sketch; when the version in `ESPIDI_FIRMWARE()` changes, it commits the build to `espidi/REDSEA.ino.bin`, which the HUB composer site loads. The HUB start screen shows `cover.png`; `REDSEA/cover.h` is generated from it.
+**ESPidi HUB.** RED SEA can share an ESPidi with a second firmware: [install it into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea). On every push the `firmware` workflow builds the sketch; when the version in `ESPIDI_FIRMWARE()` changes, it commits the build to `espidi/REDSEA.ino.bin`, which the HUB composer site loads. The HUB start screen shows `cover.png`; `REDSEA/cover.h` is generated from it.
 
 Wiring reference (see `Pins::` in the source for the authoritative list):
 
@@ -67,7 +67,7 @@ Wiring reference (see `Pins::` in the source for the authoritative list):
 
 ## Status
 
-`main` — first stable release. `beta` — per-parameter MIDI channels, note length, Freeze Roll and the TWST engine; under testing. What changed since 1.0: [CHANGELOG.md](CHANGELOG.md). Issues and pull requests welcome.
+Current version — 1.1: per-parameter MIDI channels, note length, Freeze Roll, swing and the TWST engine. What changed since 1.0: [CHANGELOG.md](CHANGELOG.md). Issues and pull requests welcome.
 
 Updating from the first release: the old global MIDI channel is copied to all four parameters on first boot, so the device behaves as before until you change the routing.
 

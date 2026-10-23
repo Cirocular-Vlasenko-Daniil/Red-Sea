@@ -2,9 +2,9 @@
 
 Что изменилось в RED SEA по сравнению с версией 1.0 (вышла 17.08.2026). English version: [CHANGELOG.md](CHANGELOG.md).
 
-## 1.1 — бета
+## 1.1 — 23.10.2026
 
-Ветка `beta`, в тестировании. Эту версию описывает [мануал](MANUAL.ru.md).
+Эту версию описывает [мануал](MANUAL.ru.md).
 
 ### Новое
 
@@ -29,7 +29,7 @@
 
   ![Подстраница TWST](docs/screens/storm_twst.png)
 
-- **ESPidi HUB.** Репозиторий готов для ESPidi HUB: `espidi.json`, обложка для экрана запуска HUB, `ESPIDI_FIRMWARE()` в скетче и workflow, который публикует сборку, — [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). Скетч переехал в `REDSEA/REDSEA.ino`.
+- **ESPidi HUB.** Репозиторий готов для ESPidi HUB: `espidi.json`, обложка для экрана запуска HUB, `ESPIDI_FIRMWARE()` в скетче и workflow, который публикует сборку, — [установить в слот HUB](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea). Скетч переехал в `REDSEA/REDSEA.ino`.
 
 ### Изменено
 
@@ -53,7 +53,7 @@
 
 ### Исправлено
 
-- Под ESPidi HUB на части плат могли не сохраняться настройки: сборка теперь в режиме флеша DIO (1.1 beta 2).
+- Под ESPidi HUB на части плат могли не сохраняться настройки: сборка теперь в режиме флеша DIO.
 - Арпеджио SUN: новая серия отражений могла оставить предыдущую ноту арпеджио висеть.
 - Подстраница MAIN: метка редактируемого значения рисовалась цветом заливки выбранной колонки — её не было видно, а цифры она частично стирала.
 - Длинные заголовки (`NOTE LEN`, `SEQ DEST`, `RFLCT`, `ROTATE`, `DEBRIS`) частично закрывал кораблик.

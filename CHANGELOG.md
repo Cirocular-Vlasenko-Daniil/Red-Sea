@@ -2,9 +2,9 @@
 
 Changes in RED SEA compared to version 1.0 (released 2026-08-17). Русская версия: [CHANGELOG.ru.md](CHANGELOG.ru.md).
 
-## 1.1 — beta
+## 1.1 — 2026-10-23
 
-Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
+The [manual](MANUAL.md) describes this version.
 
 ### New
 
@@ -29,7 +29,7 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 
   ![TWST subpage](docs/screens/storm_twst.png)
 
-- **ESPidi HUB.** The repository is ESPidi-ready: `espidi.json`, a cover for the HUB start screen, `ESPIDI_FIRMWARE()` in the sketch and a workflow that publishes the build — [install into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea@beta). The sketch moved to `REDSEA/REDSEA.ino`.
+- **ESPidi HUB.** The repository is ESPidi-ready: `espidi.json`, a cover for the HUB start screen, `ESPIDI_FIRMWARE()` in the sketch and a workflow that publishes the build — [install into a HUB slot](https://espidi-hub.github.io/?play=Cirocular-Vlasenko-Daniil/Red-Sea). The sketch moved to `REDSEA/REDSEA.ino`.
 
 ### Changed
 
@@ -53,7 +53,7 @@ Branch `beta`, under testing. The [manual](MANUAL.md) describes this version.
 
 ### Fixed
 
-- Under ESPidi HUB settings could be lost on some boards: the build is now made in DIO flash mode (1.1 beta 2).
+- Under ESPidi HUB settings could be lost on some boards: the build is now made in DIO flash mode.
 - SUN arpeggio: a new echo series could leave the previous arpeggio note hanging.
 - MAIN subpage: the edit marker was drawn in the fill color of the selected column — invisible, and it erased parts of the digits.
 - Long headers (`NOTE LEN`, `SEQ DEST`, `RFLCT`, `ROTATE`, `DEBRIS`) were partly covered by the sailboat.

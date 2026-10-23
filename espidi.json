@@ -4,7 +4,7 @@
   "firmware": "espidi/REDSEA.ino.bin",
   "cover": "cover.png",
   "summary": {
-    "en": "1.0 plus per-parameter MIDI channels, note length, Freeze Roll, swing and the TWST engine. Under testing.",
-    "ru": "1.0 плюс MIDI-каналы на каждый параметр, длина нот, Freeze Roll, свинг и движок TWST. В тестировании."
+    "en": "Weather-driven MIDI CC modulator and sequencer: per-parameter MIDI channels, note length, Freeze Roll, swing and the TWST engine.",
+    "ru": "Погодный MIDI CC-модулятор и секвенсор: MIDI-каналы на каждый параметр, длина нот, Freeze Roll, свинг и движок TWST."
   }
 }
